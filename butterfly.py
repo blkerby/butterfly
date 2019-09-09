@@ -63,6 +63,7 @@ def gen_data(N, n):
     X = torch.randn([N, n])
     return torch.cat([X, X], dim=1)
 
+version = 2
 n = 32
 seed = 7
 lr = 5.0
@@ -118,7 +119,7 @@ for i in range(1000000):
     if L < 1e-12:
         break
 
-X_test = gen_data(N, n)
+X_test = gen_data(N*100, n)
 print(loss(indices, A, B, X_test, X_test[:, perm]))
 
 import pandas as pd
@@ -127,7 +128,7 @@ df = pd.DataFrame({
     'loss': losses,
     'grad_norm': grad_norms,
 })
-df.to_feather("n{}s{}lr{}.feather".format(n, seed, lr))
+df.to_feather("v{}n{}s{}lr{}.feather".format(version, n, seed, lr))
 
 
 #
