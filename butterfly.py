@@ -38,7 +38,8 @@ def normalize(A, B):
 
 def loss(indices, A, B, X, Y):
     n = Y.shape[1]
-    pred = benes_transform(indices, A, B, X)[:, :n]
+    out = benes_transform(indices, A, B, X)
+    pred = out[:, :n] + out[:, n:]
     err = pred - Y
     return (err ** 2).mean()
 
@@ -66,13 +67,13 @@ def gen_data(N, n):
 version = 2
 n = 32
 seed = 7
-lr = 5.0
+lr = 2.5
 
 torch.random.manual_seed(seed)
 
 indices = benes_indices(n * 2)
 perm = torch.randperm(n)
-N = n*10
+N = n*len(indices)*10
 X = gen_data(N, n)
 Y = X[:, perm]
 
@@ -128,7 +129,7 @@ df = pd.DataFrame({
     'loss': losses,
     'grad_norm': grad_norms,
 })
-df.to_feather("v{}n{}s{}lr{}.feather".format(version, n, seed, lr))
+df.to_feather("v{}n{}s{}lr{}N{}.feather".format(version, n, seed, lr, N))
 
 
 #
