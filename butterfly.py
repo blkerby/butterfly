@@ -37,7 +37,8 @@ def normalize(A, B):
     return A / nm, B / nm
 
 def loss(indices, A, B, X, Y):
-    pred = benes_transform(indices, A, B, X)
+    n = Y.shape[1]
+    pred = benes_transform(indices, A, B, X)[:, :n]
     err = pred - Y
     return (err ** 2).mean()
 
@@ -57,29 +58,37 @@ def project(gA, gB, A, B):
 
 # A = torch.arange(1, 21, dtype=torch.float).view(5, 4)
 # B = torch.arange(101, 121, dtype=torch.float).view(5, 4)
-n = 16
-indices = benes_indices(n)
+
+def gen_data(N, n):
+    X = torch.randn([N, n])
+    return torch.cat([X, X], dim=1)
+
+n = 32
+indices = benes_indices(n * 2)
+torch.random.manual_seed(2)
 
 perm = torch.randperm(n)
-perm = perm[perm]
-N = 1000
-X = torch.randn([N, n])
+N = n*10
+X = gen_data(N, n)
 Y = X[:, perm]
 
 # A = (A**2).round()
 # B = (B**2).round()
 
-A = torch.randn([len(indices), n // 2])
-B = torch.randn([len(indices), n // 2])
+A = torch.randn([len(indices), n])
+B = torch.randn([len(indices), n])
 A, B = normalize(A, B)
 #
 
 
-lr = 1.0
-lam = 1e-3
-# lam = 0
+lr = 5.0
+# lam = 1e-3
+lam = 0
 
-for i in range(10000):
+losses = []
+grad_norms = []
+
+for i in range(1000000):
     A.requires_grad = True
     B.requires_grad = True
     obj = objective(indices, A, B, X, Y, lam)
@@ -91,22 +100,40 @@ for i in range(10000):
 
     A = A - lr * dA
     B = B - lr * dB
+    #
+    # rA = torch.randn([len(indices), n // 2])
+    # rB = torch.randn([len(indices), n // 2])
+    # A = A + rA * 1e-2
+    # B = B + rB * 1e-2
+
     A, B = normalize(A, B)
     L = loss(indices, A, B, X, Y)
+    gn = float((dA**2 + dB**2).sum().sqrt())
 
-    print("iteration {}: obj {}, loss {}, grad norm {}".format(i, float(obj), float(L), float((dA**2 + dB**2).sum().sqrt())))
+    losses.append(float(L))
+    grad_norms.append(gn)
+    print("iteration {}: obj {}, loss {}, grad norm {}".format(i, float(obj), float(L), gn))
     if L < 1e-12:
         break
 
-X_test = torch.randn([N, n])
+X_test = gen_data(N, n)
 print(loss(indices, A, B, X_test, X_test[:, perm]))
 
+import pandas as pd
+df = pd.DataFrame({
+    'iteration': list(range(len(losses))),
+    'loss': losses,
+    'grad_norm': grad_norms,
+})
+df.to_feather("n32s2lr5.0.feather")
 
-for i in range(1000):
-    rA = torch.randn([len(indices), n // 2])
-    rB = torch.randn([len(indices), n // 2])
-    A1 = A + rA * 1e-4
-    B1 = B + rB * 1e-4
-    A1, B1 = normalize(A1, B1)
-    if loss(indices, A1, B1, X, Y) < L:
-        print(loss(indices, A1, B1, X, Y) - L)
+
+#
+# for i in range(1000):
+#     rA = torch.randn([len(indices), n // 2])
+#     rB = torch.randn([len(indices), n // 2])
+#     A1 = A + rA * 1e-3
+#     B1 = B + rB * 1e-3
+#     A1, B1 = normalize(A1, B1)
+#     if loss(indices, A1, B1, X, Y) < L:
+#         print(loss(indices, A1, B1, X, Y) - L)
