@@ -64,9 +64,12 @@ def gen_data(N, n):
     return torch.cat([X, X], dim=1)
 
 n = 32
-indices = benes_indices(n * 2)
-torch.random.manual_seed(2)
+seed = 7
+lr = 5.0
 
+torch.random.manual_seed(seed)
+
+indices = benes_indices(n * 2)
 perm = torch.randperm(n)
 N = n*10
 X = gen_data(N, n)
@@ -81,7 +84,6 @@ A, B = normalize(A, B)
 #
 
 
-lr = 5.0
 # lam = 1e-3
 lam = 0
 
@@ -125,7 +127,7 @@ df = pd.DataFrame({
     'loss': losses,
     'grad_norm': grad_norms,
 })
-df.to_feather("n32s2lr5.0.feather")
+df.to_feather("n{}s{}lr{}.feather".format(n, seed, lr))
 
 
 #
