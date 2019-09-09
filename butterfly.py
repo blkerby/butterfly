@@ -33,7 +33,7 @@ def benes_transform(indices, A, B, X):
     return X
 
 def normalize(A, B):
-    nm = (A ** 2 + B ** 2).sqrt()
+    nm = torch.clamp((A ** 2 + B ** 2).sqrt(), min=1.0)
     return A / nm, B / nm
 
 def loss(indices, A, B, X, Y):
@@ -52,17 +52,18 @@ def objective(indices, A, B, X, Y, lam):
     return L + pen
 
 def project(gA, gB, A, B):
-    u = gA * A + gB * B
+    nm = (A ** 2 + B ** 2).sqrt()
+    u = torch.where((nm - 1).abs() > 1e-6, torch.zeros_like(gA), gA * A + gB * B)
     return gA - u * A, gB - u * B
 
 # A = torch.arange(1, 21, dtype=torch.float).view(5, 4)
 # B = torch.arange(101, 121, dtype=torch.float).view(5, 4)
-n = 16
+n = 8
 indices = benes_indices(n)
 
 perm = torch.randperm(n)
 perm = perm[perm]
-N = 1000
+N = 10
 X = torch.randn([N, n])
 Y = X[:, perm]
 
@@ -76,8 +77,7 @@ A, B = normalize(A, B)
 
 
 lr = 1.0
-lam = 1e-3
-# lam = 0
+lam = 0
 
 for i in range(10000):
     A.requires_grad = True
@@ -95,18 +95,18 @@ for i in range(10000):
     L = loss(indices, A, B, X, Y)
 
     print("iteration {}: obj {}, loss {}, grad norm {}".format(i, float(obj), float(L), float((dA**2 + dB**2).sum().sqrt())))
-    if L < 1e-12:
+    if L < 1e-10:
         break
 
 X_test = torch.randn([N, n])
 print(loss(indices, A, B, X_test, X_test[:, perm]))
 
 
-for i in range(1000):
-    rA = torch.randn([len(indices), n // 2])
-    rB = torch.randn([len(indices), n // 2])
-    A1 = A + rA * 1e-4
-    B1 = B + rB * 1e-4
-    A1, B1 = normalize(A1, B1)
-    if loss(indices, A1, B1, X, Y) < L:
-        print(loss(indices, A1, B1, X, Y) - L)
+# for i in range(10000):
+#     rA = torch.randn([len(indices), n // 2])
+#     rB = torch.randn([len(indices), n // 2])
+#     A1 = A + rA * 1e-3
+#     B1 = B + rB * 1e-3
+#     A1, B1 = normalize(A1, B1)
+#     if loss(indices, A1, B1, X, Y) < L:
+#         print(loss(indices, A1, B1, X, Y) - L)
