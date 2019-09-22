@@ -1,143 +1,101 @@
 import torch
-import torch.sparse
+import torch.optim
+import torch.optim.lbfgs
+import torch.nn
 
-def butterfly_indices(n, stride):
-    segments = n // (stride * 2)
-    I1 = (torch.arange(stride) + stride * 2 * torch.arange(segments).view([-1, 1])).view([-1])
-    I2 = I1 + stride
-    return I1, I2
-
-def benes_indices(n):
-    stride = 1
-    i = 0
-    out = []
-    while stride < n:
-        out.append(butterfly_indices(n, stride))
-        i += 1
-        stride *= 2
-    stride //= 4
-    while stride >= 1:
-        out.append(butterfly_indices(n, stride))
-        i += 1
-        stride //= 2
-    return out
-
-def benes_transform(indices, A, B, X):
-    for i in range(len(indices)):
-        I1 = indices[i][0]
-        I2 = indices[i][1]
-        X1 = torch.zeros_like(X)
-        X1[:, I1] = A[i, :] * X[:, I1] + B[i, :] * X[:, I2]
-        X1[:, I2] = -B[i, :] * X[:, I1] + A[i, :] * X[:, I2]
-        X = X1
-    return X
-
-def normalize(A, B):
-    nm = (A ** 2 + B ** 2).sqrt()
-    return A / nm, B / nm
-
-def loss(indices, A, B, X, Y):
-    n = Y.shape[1]
-    out = benes_transform(indices, A, B, X)
-    pred = out[:, :n] + out[:, n:]
-    err = pred - Y
+def compute_loss(pY, Y):
+    err = pY - Y
     return (err ** 2).mean()
 
-def penalty(A, B, lam):
-    A2 = A ** 2
-    B2 = B ** 2
-    return lam * (A2 * (1 - A2) + B2 * (1 - B2)).sum()
+def compute_objective(params, loss, lam):
+    # return loss + lam*torch.mean(params * (1-params))
+    return loss + lam*torch.mean((params**2 + (1-params)**2))
 
-def objective(indices, A, B, X, Y, lam):
-    L = loss(indices, A, B, X, Y)
-    pen = penalty(A, B, lam)
-    return L + pen
+def gen_data(N, n, perm):
+    X = torch.rand([N, n])
+    # X = torch.randn([N, n])
+    # X = torch.empty([N, n])
+    # for i in range(N):
+    #     X[i, :] = torch.randperm(n, dtype=torch.float) / (n - 1)
+    Y = X[:, perm]
+    return X, Y
 
-def project(gA, gB, A, B):
-    u = gA * A + gB * B
-    return gA - u * A, gB - u * B
+class DoublyStochasticButterfly(torch.nn.Module):
+    def __init__(self, width_pow, depth):
+        super().__init__()
+        self.width_pow = width_pow
+        self.width = 2**width_pow
+        self.half_width = 2**(width_pow - 1)
+        self.depth = depth
+        # rand_sgn = (torch.randint(2, [self.half_width, depth]) * 2 - 1).type(torch.float)
+        # initial_params = rand_sgn * (1 - torch.rand(self.half_width, depth) / depth) / 2 + 0.5
+        initial_params = torch.rand(self.half_width, depth)
+        self.params = torch.nn.Parameter(initial_params)
+        self.perm = torch.zeros([self.width], dtype=torch.long)
+        for i in range(self.width):
+            if i % 2 == 0:
+                self.perm[i] = i // 2
+            else:
+                self.perm[i] = i // 2 + self.half_width
 
-# A = torch.arange(1, 21, dtype=torch.float).view(5, 4)
-# B = torch.arange(101, 121, dtype=torch.float).view(5, 4)
+    def forward(self, X):
+        input_width = X.shape[1]
+        X = torch.cat([X, torch.zeros([X.shape[0], self.width - X.shape[1]], dtype=X.dtype)], dim=1)
+        for i in range(self.depth):
+            W = self.params[:, i]
+            X0 = X[:, :self.half_width]
+            X1 = X[:, self.half_width:]
+            # X0W = X0 * W
+            # X1W = X1 * W
+            # new_X0 = X0 - X0W + X1W
+            # # new_X1 = X1 - X1W + X0W
+            # new_X1 = X1 - X1W - X0W
+            new_X0 = X0 * (1 - W) + X1 * W
+            new_X1 = X0 * W + X1 * (1 - W)
+            X = torch.cat([new_X0, new_X1], dim=1)[:, self.perm]
+        return X[:, :input_width]
 
-def gen_data(N, n):
-    X = torch.randn([N, n])
-    return torch.cat([X, X], dim=1)
 
-version = 2
-n = 32
-seed = 7
-lr = 2.5
+# model = DoublyStochasticButterfly(1, 1)
+# model(torch.tensor([[100, 200]], dtype=torch.float))
 
+
+n = 64
+N = 64
+# N = 8
+seed = 0
+lam = 1e-3
+# lam = 0.0
+lr = 5.0
 torch.random.manual_seed(seed)
-
-indices = benes_indices(n * 2)
 perm = torch.randperm(n)
-N = n*len(indices)*10
-X = gen_data(N, n)
-Y = X[:, perm]
+X, Y = gen_data(N, n, perm)
+model = DoublyStochasticButterfly(7, 22)
 
-# A = (A**2).round()
-# B = (B**2).round()
-
-A = torch.randn([len(indices), n])
-B = torch.randn([len(indices), n])
-A, B = normalize(A, B)
-#
-
-
-# lam = 1e-3
-lam = 0
-
-losses = []
-grad_norms = []
-
+last_loss = float("Inf")
+last_gn = float("Inf")
 for i in range(1000000):
-    A.requires_grad = True
-    B.requires_grad = True
-    obj = objective(indices, A, B, X, Y, lam)
-
+    # lam *= 1 - 1e-3
+    model.zero_grad()
+    pY = model(X)
+    loss = compute_loss(pY, Y)
+    obj = compute_objective(model.params, loss, lam)
     obj.backward()
-    A.requires_grad = False
-    B.requires_grad = False
-    dA, dB = project(A.grad, B.grad, A, B)
 
-    A = A - lr * dA
-    B = B - lr * dB
-    #
-    # rA = torch.randn([len(indices), n // 2])
-    # rB = torch.randn([len(indices), n // 2])
-    # A = A + rA * 1e-2
-    # B = B + rB * 1e-2
+    with torch.no_grad():
+        raw_g = model.params.grad
+        g = torch.where(((model.params == 0.0) & (raw_g > 0)) | ((model.params == 1.0) & (raw_g < 0)),
+                        torch.zeros_like(raw_g), raw_g)
+        # print(torch.stack([model.params[:, 0], raw_g[:, 0], g[:, 0]], dim=1))
+        # print(X, pY, Y)
+        model.params.data = torch.clamp(model.params.data - lr * g, 0.0, 1.0)
+        gn = torch.sqrt(torch.sum(g ** 2))
+        print("iteration {}: obj {}, loss {}, grad norm {}, lam {}".format(i, float(obj), float(loss), gn, lam))
+        if lam < 1e-5 and (gn < 1e-6 or (last_loss == loss and last_gn == gn)):
+            break
+        last_loss = loss
+        last_gn = gn
 
-    A, B = normalize(A, B)
-    L = loss(indices, A, B, X, Y)
-    gn = float((dA**2 + dB**2).sum().sqrt())
-
-    losses.append(float(L))
-    grad_norms.append(gn)
-    print("iteration {}: obj {}, loss {}, grad norm {}".format(i, float(obj), float(L), gn))
-    if L < 1e-12:
-        break
-
-X_test = gen_data(N*100, n)
-print(loss(indices, A, B, X_test, X_test[:, perm]))
-
-import pandas as pd
-df = pd.DataFrame({
-    'iteration': list(range(len(losses))),
-    'loss': losses,
-    'grad_norm': grad_norms,
-})
-df.to_feather("v{}n{}s{}lr{}N{}.feather".format(version, n, seed, lr, N))
-
-
-#
-# for i in range(1000):
-#     rA = torch.randn([len(indices), n // 2])
-#     rB = torch.randn([len(indices), n // 2])
-#     A1 = A + rA * 1e-3
-#     B1 = B + rB * 1e-3
-#     A1, B1 = normalize(A1, B1)
-#     if loss(indices, A1, B1, X, Y) < L:
-#         print(loss(indices, A1, B1, X, Y) - L)
+# model.weight.data = torch.round(model.weight)
+X_test, Y_test = gen_data(N*100, n, perm)
+print(compute_loss(model(X_test), Y_test))
