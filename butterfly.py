@@ -9,10 +9,11 @@ def compute_loss(pY, Y):
 
 def compute_objective(params, loss, lam):
     # return loss + lam*torch.mean(params * (1-params))
-    return loss + lam*torch.mean((params**2 + (1-params)**2))
+    # return loss + lam*torch.mean((params**2 + (1-params)**2))
+    return loss + lam*torch.mean(params**2)
 
 def gen_data(N, n, perm):
-    X = torch.rand([N, n])
+    X = torch.rand([N, n]) * 2 - 1
     # X = torch.randn([N, n])
     # X = torch.empty([N, n])
     # for i in range(N):
@@ -27,9 +28,9 @@ class DoublyStochasticButterfly(torch.nn.Module):
         self.width = 2**width_pow
         self.half_width = 2**(width_pow - 1)
         self.depth = depth
-        # rand_sgn = (torch.randint(2, [self.half_width, depth]) * 2 - 1).type(torch.float)
-        # initial_params = rand_sgn * (1 - torch.rand(self.half_width, depth) / depth) / 2 + 0.5
-        initial_params = torch.rand(self.half_width, depth)
+        rand_sgn = (torch.randint(2, [self.width, depth]) * 2 - 1).type(torch.float)
+        initial_params = rand_sgn * (1 - torch.rand(self.width, depth) / depth)
+        # initial_params = torch.rand(self.width, depth) * 2 - 1
         self.params = torch.nn.Parameter(initial_params)
         self.perm = torch.zeros([self.width], dtype=torch.long)
         for i in range(self.width):
@@ -42,7 +43,10 @@ class DoublyStochasticButterfly(torch.nn.Module):
         input_width = X.shape[1]
         X = torch.cat([X, torch.zeros([X.shape[0], self.width - X.shape[1]], dtype=X.dtype)], dim=1)
         for i in range(self.depth):
-            W = self.params[:, i]
+            A = self.params[:self.half_width, i]
+            B = self.params[self.half_width:, i]
+            U = (A + B) / 2
+            V = (A - B) / 2
             X0 = X[:, :self.half_width]
             X1 = X[:, self.half_width:]
             # X0W = X0 * W
@@ -50,8 +54,9 @@ class DoublyStochasticButterfly(torch.nn.Module):
             # new_X0 = X0 - X0W + X1W
             # # new_X1 = X1 - X1W + X0W
             # new_X1 = X1 - X1W - X0W
-            new_X0 = X0 * (1 - W) + X1 * W
-            new_X1 = X0 * W + X1 * (1 - W)
+            new_X0 = X0 * U + X1 * V
+            new_X1 = X0 * -V + X1 * U
+            # print((U.abs() + V.abs()))
             X = torch.cat([new_X0, new_X1], dim=1)[:, self.perm]
         return X[:, :input_width]
 
@@ -60,22 +65,28 @@ class DoublyStochasticButterfly(torch.nn.Module):
 # model(torch.tensor([[100, 200]], dtype=torch.float))
 
 
-n = 64
-N = 64
-# N = 8
-seed = 0
-lam = 1e-3
-# lam = 0.0
-lr = 5.0
+n = 4
+N = n
+seed = 6
+# lam = 0.1
+lam = 0.0
+lr = 1.0
 torch.random.manual_seed(seed)
 perm = torch.randperm(n)
+perm = perm[perm]
 X, Y = gen_data(N, n, perm)
-model = DoublyStochasticButterfly(7, 22)
+model = DoublyStochasticButterfly(2, 4)
+
+
+# a = torch.zeros([1, 16])
+# a[0, 0] = 1
+# print(model(a))
+
 
 last_loss = float("Inf")
 last_gn = float("Inf")
 for i in range(1000000):
-    # lam *= 1 - 1e-3
+    lam *= 1 - 1e-3
     model.zero_grad()
     pY = model(X)
     loss = compute_loss(pY, Y)
@@ -84,14 +95,14 @@ for i in range(1000000):
 
     with torch.no_grad():
         raw_g = model.params.grad
-        g = torch.where(((model.params == 0.0) & (raw_g > 0)) | ((model.params == 1.0) & (raw_g < 0)),
+        g = torch.where(((model.params == -1.0) & (raw_g > 0)) | ((model.params == 1.0) & (raw_g < 0)),
                         torch.zeros_like(raw_g), raw_g)
         # print(torch.stack([model.params[:, 0], raw_g[:, 0], g[:, 0]], dim=1))
         # print(X, pY, Y)
-        model.params.data = torch.clamp(model.params.data - lr * g, 0.0, 1.0)
+        model.params.data = torch.clamp(model.params.data - lr * g, -1.0, 1.0)
         gn = torch.sqrt(torch.sum(g ** 2))
         print("iteration {}: obj {}, loss {}, grad norm {}, lam {}".format(i, float(obj), float(loss), gn, lam))
-        if lam < 1e-5 and (gn < 1e-6 or (last_loss == loss and last_gn == gn)):
+        if lam < 1e-5 and (gn < 1e-7 or (last_loss == loss and last_gn == gn)):
             break
         last_loss = loss
         last_gn = gn
