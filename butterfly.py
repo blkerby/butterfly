@@ -2,6 +2,7 @@ import torch
 import torch.optim
 import torch.optim.lbfgs
 import torch.nn
+import math
 
 def compute_loss(pY, Y):
     err = pY - Y
@@ -10,27 +11,28 @@ def compute_loss(pY, Y):
 def compute_objective(params, loss, lam):
     # return loss + lam*torch.mean(params * (1-params))
     # return loss + lam*torch.mean((params**2 + (1-params)**2))
-    return loss + lam*torch.mean(params**2)
+    return loss + lam*torch.mean(torch.sin(2*params)**2)
 
-def gen_data(N, n, perm):
-    X = torch.rand([N, n]) * 2 - 1
-    # X = torch.randn([N, n])
-    # X = torch.empty([N, n])
-    # for i in range(N):
-    #     X[i, :] = torch.randperm(n, dtype=torch.float) / (n - 1)
+def gen_data_perm(N, n, perm):
+    X = torch.rand([N, n], dtype=torch.float) * 2 - 1
     Y = X[:, perm]
     return X, Y
 
-class DoublyStochasticButterfly(torch.nn.Module):
-    def __init__(self, width_pow, depth):
+def gen_data_cos(N, n, scale):
+    X = torch.zeros([N, n], dtype=torch.float)
+    X[:, 0] = torch.rand([N], dtype=torch.float) * scale
+    Y = torch.cos(X[:, 0])
+    return X, Y
+
+
+class OrthogonalButterfly(torch.nn.Module):
+    def __init__(self, width_pow, depth, dtype=torch.float):
         super().__init__()
         self.width_pow = width_pow
         self.width = 2**width_pow
         self.half_width = 2**(width_pow - 1)
         self.depth = depth
-        # rand_sgn = (torch.randint(2, [self.width, depth]) * 2 - 1).type(torch.float)
-        # initial_params = rand_sgn * (1 - torch.rand(self.width, depth) / depth)
-        initial_params = torch.rand(self.half_width, depth)
+        initial_params = torch.rand(self.half_width, depth, dtype=dtype) * math.pi * 2
         self.params = torch.nn.Parameter(initial_params)
         self.perm = torch.zeros([self.width], dtype=torch.long)
         for i in range(self.width):
@@ -46,39 +48,54 @@ class DoublyStochasticButterfly(torch.nn.Module):
             theta = self.params[:, i]
             cos_theta = torch.cos(theta)
             sin_theta = torch.sin(theta)
-            # W1 = self.params[self.half_width:, i]
             X0 = X[:, :self.half_width]
             X1 = X[:, self.half_width:]
-            # X0W = X0 * W
-            # X1W = X1 * W
-            # new_X0 = X0 - X0W + X1W
-            # # new_X1 = X1 - X1W + X0W
-            # new_X1 = X1 - X1W - X0W
             new_X0 = X0 * cos_theta + X1 * sin_theta
             new_X1 = X0 * -sin_theta + X1 * cos_theta
-            # print((U.abs() + V.abs()))
-            X = torch.cat([new_X0, new_X1], dim=1)[:, self.perm]
+            X = torch.cat([new_X0, new_X1], dim=1)
+            X = X[:, self.perm]
         return X[:, :input_width]
+
+
+class SmoothBendActivation(torch.nn.Module):
+    def __init__(self, width, dtype=torch.float):
+        self.bias = torch.nn.Parameter(torch.zeros([width], dtype=dtype))
+        self.slope_1 = torch.nn.Parameter(torch.zeros([width], dtype=dtype))
+        self.slope_2 = torch.nn.Parameter(torch.zeros([width], dtype=dtype))
+        self.curvature = torch.nn.Parameter(torch.zeros([width], dtype=dtype))
+
+    def forward(self, X):
+        m1 = torch.exp(self.slope_1)
+        m2 = torch.exp(self.slope_2)
+        a = (m1 + m2) / 2
+        c = (m2 - m1) / (2 * a)
+        b = torch.sinh(self.bias)
+        k = torch.exp(self.curvature)
+        u = a * X - b
+        return u + c * torch.sqrt(u**2 + k)
+
 
 
 # model = DoublyStochasticButterfly(1, 1)
 # model(torch.tensor([[100, 200]], dtype=torch.float))
 
-
-for seed in range(1000):
-    n = 64
-    N = 64
+for seed in range(0, 1000):
+    n = 32
+    N = 16
     # seed = 0
-    # lam = 0.1
-    lam = 0.0
-    lr = 20.0
+    # lam = 0.02
+    # lam = 0.005
+    lam = 0
     torch.random.manual_seed(seed)
     perm = torch.randperm(n)
-    # perm = perm[perm]
+    perm = perm[perm]
     X, Y = gen_data(N, n, perm)
-    model = DoublyStochasticButterfly(7, 15)
+    model = OrthogonalButterfly(6, 19)
 
 
+
+    optimizer = torch.optim.LBFGS([model.params], tolerance_grad=0, tolerance_change=0,
+                                  line_search_fn='strong_wolfe')
     # a = torch.zeros([1, 16])
     # a[0, 0] = 1
     # print(model(a))
@@ -87,30 +104,35 @@ for seed in range(1000):
     last_loss = float("Inf")
     last_gn = float("Inf")
     for i in range(1000000):
-        lam *= 1 - 1e-3
-        model.zero_grad()
-        pY = model(X)
-        loss = compute_loss(pY, Y)
-        obj = compute_objective(model.params, loss, lam)
-        obj.backward()
+        # lam *= 1 - 1e-3
+        eval_cnt = 0
+
+        def closure():
+            global eval_cnt
+            eval_cnt += 1
+            optimizer.zero_grad()
+            model.zero_grad()
+            pY = model(X)
+            loss = compute_loss(pY, Y)
+            obj = compute_objective(model.params, loss, lam)
+            obj.backward()
+            return obj
+
+        optimizer.step(closure)
+
 
         with torch.no_grad():
-            raw_g = model.params.grad
-            g = raw_g
-            # g = torch.where(((model.params == 0.0) & (raw_g > 0)) | ((model.params == 1.0) & (raw_g < 0)),
-            #                 torch.zeros_like(raw_g), raw_g)
-            # print(torch.stack([model.params[:, 0], raw_g[:, 0], g[:, 0]], dim=1))
-            # print(X, pY, Y)
-            # model.params.data = torch.clamp(model.params.data - lr * g, 0.0, 1.0)
-            model.params.data = model.params.data - lr * g
+            g = model.params.grad
+            pY = model(X)
+            loss = compute_loss(pY, Y)
+            obj = compute_objective(model.params, loss, lam)
 
             gn = torch.sqrt(torch.sum(g ** 2))
-            if i % 100 == 0:
-                print("seed {}, iteration {}: obj {}, loss {}, grad norm {}, lam {}".format(seed, i, float(obj), float(loss), gn, lam))
-            # if lam < 1e-5 and (gn < 1e-6 or (last_loss == loss and last_gn == gn)):
-            if loss < 1e-5:
-                print("seed {}, iteration {}: obj {}, loss {}, grad norm {}, lam {}".format(seed, i, float(obj),
-                                                                                            float(loss), gn, lam))
+            # if i % 100 == 0:
+            print("seed {}, iteration {}: obj {}, loss {}, grad norm {}, eval_cnt {}, lam {}".format(seed, i, float(obj), float(loss), gn, eval_cnt, lam))
+            if gn < 1e-6 or (last_loss == loss and last_gn == gn):
+            # if loss < 1e-7:
+                # print("seed {}, iteration {}: loss {}, grad norm {}, lam {}".format(seed, i, float(loss), gn, lam))
                 break
             last_loss = loss
             last_gn = gn
