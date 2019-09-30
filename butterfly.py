@@ -80,23 +80,23 @@ class SmoothBendActivation(torch.nn.Module):
 
     def forward(self, X):
         assert X.dtype == self.dtype
-        m1 = torch.exp(self.slope_1)
-        m2 = torch.exp(self.slope_2)
+        m1 = self.slope_1
+        m2 = self.slope_2
         # m1 = self.slope_1 + 1
         # m2 = self.slope_2 + 1
         a = (m1 + m2) / 2
         c = (m2 - m1) / (2 * a)
         # c = (m2 - m1) / 2
-        b = torch.sinh(self.bias)
-        k = torch.exp(self.curvature)
+        b = self.bias
+        k = self.curvature
         # b = self.bias
         # k = self.curvature ** 2 + 1
         u = X * a - b
-        return u + c * torch.sqrt(u**2 + 1 / k)
+        return u + c * torch.sqrt(u**2 + 1 / k**2)
 
     def penalty(self):
         return torch.sum(self.penalty_bias * self.bias**2) + \
-            torch.sum(self.penalty_slope * (self.slope_1**2 + self.slope_2**2)) + \
+            torch.sum(self.penalty_slope * ((self.slope_1 - 1)**2 + (self.slope_2 - 1)**2)) + \
             torch.sum(self.penalty_curvature * self.curvature**2)
 
 
@@ -143,7 +143,8 @@ class CustomNetwork(torch.nn.Module):
         self.all_layers = []
         for i in range(depth):
             butterfly = OrthogonalButterfly(width_pow, butterfly_depth, l2_interact, dtype=dtype)
-            activation = SmoothSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
+            # activation = SmoothSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
+            activation = SmoothBendActivation(self.width, l2_bias, l2_slope, l2_scale, dtype=torch.float)
             self.butterfly_layers.append(butterfly)
             self.all_layers.append(butterfly)
             if i != depth - 1:
@@ -172,7 +173,7 @@ class CustomNetwork(torch.nn.Module):
 
 N = 40
 scale = 10
-seed = 0
+seed = 4
 # dtype = torch.double
 dtype = torch.float
 
@@ -190,9 +191,9 @@ model = CustomNetwork(
     width_pow=3,
     depth=3,
     butterfly_depth=3,
-    l2_slope=0.00005, #0.0000005, #0.0001,
+    l2_slope=0.00003, #0.0000005, #0.0001,
     # l2_slope=0.000001, #0.0001,
-    l2_scale=3e-6, #0.0000001, # 0.0000001,#0.00001,
+    l2_scale=2e-5, #0.0000001, # 0.0000001,#0.00001,
     l2_bias=0.0,
     l2_interact=0.0,#1e-4, #1e-5, #0.0001, #0.0001,
     dtype=dtype
