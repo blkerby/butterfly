@@ -22,7 +22,7 @@ def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=dtype) - 0.5) * scale
     # Y = torch.cos(X)
     # Y = X * torch.sin(1 / X)
-    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X))
+    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
     Y = Y_true + noise * torch.randn([N, 1], dtype=dtype)
     return X, Y_true, Y
 
@@ -123,6 +123,54 @@ class SmoothSquashActivation(torch.nn.Module):
                 torch.sum(self.l2_bias * self.bias ** 2)
 
 
+
+class CubicSquashActivation(torch.nn.Module):
+    def __init__(self, width, l2_slope, l2_scale, l2_bias, dtype=torch.float):
+        super().__init__()
+        self.dtype = dtype
+        self.l2_slope = l2_slope
+        self.l2_scale = l2_scale
+        self.l2_bias = l2_bias
+        eps = 0.001
+        self.bias = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps)
+        self.slope = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype))
+
+    def forward(self, X):
+        assert X.dtype == self.dtype
+        u = torch.clamp((X * self.slope - self.bias) / self.scale, -1, 1)
+        return self.scale * (1.5 * u - 0.5 * u ** 3)
+
+    def penalty(self):
+        return torch.sum(self.l2_slope * (self.slope - 1) ** 2) + \
+                torch.sum(self.l2_scale * self.scale ** 2) + \
+                torch.sum(self.l2_bias * self.bias ** 2)
+
+
+
+class QuinticSquashActivation(torch.nn.Module):
+    def __init__(self, width, l2_slope, l2_scale, l2_bias, dtype=torch.float):
+        super().__init__()
+        self.dtype = dtype
+        self.l2_slope = l2_slope
+        self.l2_scale = l2_scale
+        self.l2_bias = l2_bias
+        eps = 0.1
+        self.bias = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps)
+        self.slope = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+
+    def forward(self, X):
+        assert X.dtype == self.dtype
+        u = torch.clamp((X * self.slope - self.bias) / self.scale, -1, 1)
+        return self.scale * (1.875 * u - 1.25 * u ** 3 + 0.375 * u ** 5)
+
+    def penalty(self):
+        return torch.sum(self.l2_slope * (self.slope - 1) ** 2) + \
+                torch.sum(self.l2_scale * self.scale ** 2) + \
+                torch.sum(self.l2_bias * self.bias ** 2)
+
+
 class CustomNetwork(torch.nn.Module):
     def __init__(self, num_inputs, num_outputs, width_pow, depth, butterfly_depth,
                  l2_slope, l2_scale, l2_bias, l2_interact, dtype=torch.float):
@@ -143,8 +191,10 @@ class CustomNetwork(torch.nn.Module):
         self.all_layers = []
         for i in range(depth):
             butterfly = OrthogonalButterfly(width_pow, butterfly_depth, l2_interact, dtype=dtype)
+            activation = QuinticSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
+            # activation = CubicSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
             # activation = SmoothSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
-            activation = SmoothBendActivation(self.width, l2_bias, l2_slope, l2_scale, dtype=torch.float)
+            # activation = SmoothBendActivation(self.width, l2_bias, l2_slope, l2_scale, dtype=torch.float)
             self.butterfly_layers.append(butterfly)
             self.all_layers.append(butterfly)
             if i != depth - 1:
@@ -171,37 +221,114 @@ class CustomNetwork(torch.nn.Module):
         return total
 
 
-N = 40
-scale = 10
-seed = 4
+class L2Linear(torch.nn.Module):
+    def __init__(self, num_inputs, num_outputs, l2):
+        super().__init__()
+        self.l2 = l2
+        self.lin = torch.nn.Linear(num_inputs, num_outputs, bias=False)
+
+    def forward(self, X):
+        return self.lin(X)
+
+    def penalty(self):
+        return self.l2 * torch.sum(self.lin.weight ** 2)
+
+
+class FullyConnectedNetwork(torch.nn.Module):
+    def __init__(self, num_inputs, num_outputs, width_pow, depth,
+                 l2_slope, l2_scale, l2_bias, l2_lin, dtype=torch.float):
+        super().__init__()
+        self.dtype = dtype
+        self.num_inputs = num_inputs
+        self.num_outputs = num_outputs
+        self.width_pow = width_pow
+        self.depth = depth
+        self.l2_slope = l2_slope
+        self.l2_scale = l2_scale
+        self.l2_bias = l2_bias
+        self.l2_lin = l2_lin
+        self.width = 2 ** width_pow
+        self.lin_layers = []
+        self.activation_layers = []
+        self.all_layers = []
+        for i in range(depth):
+            lin = L2Linear(self.width, self.width, l2_lin)
+            activation = QuinticSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
+            # activation = CubicSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
+            # activation = SmoothSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
+            # activation = SmoothBendActivation(self.width, l2_bias, l2_slope, l2_scale, dtype=torch.float)
+            self.lin_layers.append(lin)
+            self.all_layers.append(lin)
+            if i != depth - 1:
+                self.activation_layers.append(activation)
+                self.all_layers.append(activation)
+        self.sequential = torch.nn.Sequential(*self.all_layers)
+
+    def forward(self, X):
+        assert X.dtype == self.dtype
+        assert X.shape[1] == self.num_inputs
+        X_in = torch.cat([X, torch.zeros([X.shape[0], self.width - self.num_inputs], dtype=self.dtype)], axis=1)
+        return self.sequential.forward(X_in)[:, :self.num_outputs]
+
+    def penalty(self):
+        total = 0
+        for layer in self.activation_layers:
+            layer.l2_slope = self.l2_slope
+            layer.l2_scale = self.l2_scale
+            layer.l2_bias = self.l2_bias
+            total += layer.penalty()
+        for layer in self.lin_layers:
+            layer.l2 = self.l2_lin
+            total += layer.penalty()
+        return total
+
+
+N = 200
+scale = 25
+seed = 0
 # dtype = torch.double
 dtype = torch.float
 
 torch.random.manual_seed(seed)
 
 # Generate the data
-X, Y_true, Y = gen_data(N, scale, noise=0.1, dtype=dtype)
-# X, Y_true, Y = gen_data(N, scale, noise=0.2, dtype=dtype)
-X_test, _, Y_test = gen_data(2000, scale, 0, dtype)
+X, Y_true, Y = gen_data(N, scale, noise=0.25, dtype=dtype)
+X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
-# Construct/initialize the model
-model = CustomNetwork(
+# Construct/initialize the model (0.023523079231381416)
+# model = CustomNetwork(
+#     num_inputs=1,
+#     num_outputs=1,
+#     width_pow=7,
+#     depth=3,
+#     butterfly_depth=7,
+#     l2_slope=0.00006, #0.0000005, #0.0001,
+#     # l2_slope=0.000001, #0.0001,
+#     l2_scale=1e-7, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
+#     l2_bias=0.0,
+#     l2_interact=0.0,#1e-4, #1e-5, #0.0001, #0.0001,
+#     dtype=dtype
+# )
+
+# (0.03714136406779289)
+model = FullyConnectedNetwork(
     num_inputs=1,
     num_outputs=1,
-    width_pow=3,
+    width_pow=7,
     depth=3,
-    butterfly_depth=3,
-    l2_slope=0.00003, #0.0000005, #0.0001,
+    l2_slope=0.00006, #0.0000005, #0.0001,
     # l2_slope=0.000001, #0.0001,
-    l2_scale=2e-5, #0.0000001, # 0.0000001,#0.00001,
+    l2_scale=1e-7, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
     l2_bias=0.0,
-    l2_interact=0.0,#1e-4, #1e-5, #0.0001, #0.0001,
+    l2_lin=0.00006, #1e-4, #1e-5, #0.0001, #0.0001,
     dtype=dtype
 )
 
-optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=5, max_eval=20, history_size=500, tolerance_grad=0, tolerance_change=0,
+
+
+optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=5, max_eval=20, history_size=50, tolerance_grad=0, tolerance_change=0,
                               line_search_fn='strong_wolfe')
-# optimizer =torch.optim.SGD(model.parameters(), lr=0.001)
+# optimizer =torch.optim.SGD(model.parameters(), lr=0.1)
 
 fig = plt.gcf()
 fig.show()
@@ -225,39 +352,40 @@ for i in range(100000):
 
     optimizer.step(closure)
 
-    model.zero_grad()
-    pY = model(X)
-    loss = compute_loss(pY, Y)
-    obj = compute_objective(model, loss)
-    obj.backward()
-
-    with torch.no_grad():
-        # print(list(model.parameters()))
-        gn = torch.sqrt(sum(torch.sum(X.grad**2) for X in model.parameters()))
+    if i % 1 == 0:
+        model.zero_grad()
         pY = model(X)
-        train_loss = compute_loss(pY, Y)
-        obj = compute_objective(model, train_loss)
+        loss = compute_loss(pY, Y)
+        obj = compute_objective(model, loss)
+        obj.backward()
 
         with torch.no_grad():
-            pY_test = model(X_test)
-            test_loss = compute_loss(pY_test, Y_test)
-            ind = torch.argsort(X_test[:, 0])
-            fig.clear()
-            plt.plot(X_test[ind, 0], Y_test[ind, 0], color='blue')
-            plt.plot(X_test[ind, 0], pY_test[ind, 0], color='black')
-            plt.scatter(X[:, 0], Y[:, 0], color='black')
-            fig.canvas.draw()
+            # print(list(model.parameters()))
+            gn = torch.sqrt(sum(torch.sum(X.grad**2) for X in model.parameters()))
+            pY = model(X)
+            train_loss = compute_loss(pY, Y)
+            obj = compute_objective(model, train_loss)
 
-        # if i % 100 == 0:
-        print("seed {}, iteration {}: obj {}, train {}, true {}, obj grad norm {}".format(
-            seed, i, float(obj), float(loss), float(test_loss), gn))
-        if gn < 1e-7 or (last_loss == loss and last_gn == gn):
-        # if loss < 1e-7:
+            with torch.no_grad():
+                pY_test = model(X_test)
+                test_loss = compute_loss(pY_test, Y_test)
+                ind = torch.argsort(X_test[:, 0])
+                fig.clear()
+                plt.plot(X_test[ind, 0], Y_test[ind, 0], color='blue')
+                plt.plot(X_test[ind, 0], pY_test[ind, 0], color='black')
+                plt.scatter(X[:, 0], Y[:, 0], color='black', marker='.')
+                fig.canvas.draw()
+
+            # if i % 100 == 0:
             print("seed {}, iteration {}: obj {}, train {}, true {}, obj grad norm {}".format(
                 seed, i, float(obj), float(loss), float(test_loss), gn))
-            break
-        last_loss = loss
-        last_gn = gn
+            if gn < 1e-7 or (last_loss == loss and last_gn == gn):
+            # if loss < 1e-7:
+                print("seed {}, iteration {}: obj {}, train {}, true {}, obj grad norm {}".format(
+                    seed, i, float(obj), float(loss), float(test_loss), gn))
+                break
+            last_loss = loss
+            last_gn = gn
 
 
 plt.show()
