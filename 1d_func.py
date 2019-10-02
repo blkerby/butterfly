@@ -40,39 +40,39 @@ X, Y_true, Y = gen_data(N, scale, noise=0.25, dtype=dtype)
 X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
 # Construct/initialize the model (0.023523079231381416)
-# model = CustomNetwork(
-#     num_inputs=1,
-#     num_outputs=1,
-#     width_pow=6,
-#     depth=3,
-#     butterfly_depth=6,
-#     l2_slope=0, # 0.00003, #0.0000005, #0.0001,
-#     # l2_slope=0.000001, #0.0001,
-#     l2_scale=0, #1e-7, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
-#     l2_bias=0.0,
-#     l2_interact=0.0,
-#     dtype=dtype
-# )
-
-# (0.03714136406779289)
-model = FullyConnectedNetwork(
+model = CustomNetwork(
     num_inputs=1,
     num_outputs=1,
     width_pow=6,
     depth=3,
-    l2_slope=0, #0.00006, #0.0000005, #0.0001,
+    butterfly_depth=6,
+    l2_slope=0, # 0.00003, #0.0000005, #0.0001,
     # l2_slope=0.000001, #0.0001,
     l2_scale=0, #1e-7, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
     l2_bias=0.0,
-    l2_lin=0, #0.00006, #1e-4, #1e-5, #0.0001, #0.0001,
+    l2_interact=0.0,
     dtype=dtype
 )
 
+# # (0.03714136406779289)
+# model = FullyConnectedNetwork(
+#     num_inputs=1,
+#     num_outputs=1,
+#     width_pow=6,
+#     depth=3,
+#     l2_slope=0, #0.00006, #0.0000005, #0.0001,
+#     # l2_slope=0.000001, #0.0001,
+#     l2_scale=0, #1e-7, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
+#     l2_bias=0.0,
+#     l2_lin=0, #0.00006, #1e-4, #1e-5, #0.0001, #0.0001,
+#     dtype=dtype
+# )
 
 
-optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=5, max_eval=20, history_size=500, tolerance_grad=0, tolerance_change=0,
-                              line_search_fn='strong_wolfe')
-# optimizer =torch.optim.SGD(model.parameters(), lr=0.1)
+
+# optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=5, max_eval=20, history_size=500, tolerance_grad=0, tolerance_change=0,
+#                               line_search_fn='strong_wolfe')
+# optimizer =torch.optim.SGD(model.parameters(), lr=0.02, nesterov=True, momentum=0.5)
 
 fig = plt.gcf()
 fig.show()
