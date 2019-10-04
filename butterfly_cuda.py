@@ -31,20 +31,23 @@ class OrthogonalButterflyLayerFunction(torch.autograd.Function):
         
 
 # TODO: combine CPU and CUDA versions into one class (also implement optimized CPU version in C++)
-class OrthogonalButterflyLayer(torch.nn.Module):
-    def __init__(self, width_pow, l2_interact, dtype=torch.float, device=None):
+class OrthogonalButterfly(torch.nn.Module):
+    def __init__(self, width_pow, depth, l2_interact, dtype=torch.float, device=None):
         super().__init__()
         self.dtype = dtype
         self.width_pow = width_pow
         self.width = 2**width_pow
+        self.depth = depth
         self.l2_interact = l2_interact
-        initial_angless = torch.rand(self.width // 2, dtype=dtype, device=device) * math.pi * 2
-        self.angles = torch.nn.Parameter(initial_angless)
+        initial_angles = torch.rand(depth, self.width // 2, dtype=dtype, device=device) * math.pi * 2
+        self.angles = torch.nn.Parameter(initial_angles)
 
     def forward(self, X):
         assert X.dtype == self.dtype
         X = torch.cat([X, torch.zeros([self.width - X.shape[0], X.shape[1]], dtype=X.dtype, device=X.device)], dim=0)
-        return OrthogonalButterflyLayerFunction.apply(X, self.angles)
+        for i in range(self.depth):
+            X = OrthogonalButterflyLayerFunction.apply(X, self.angles[i, :])
+        return X
 
     def penalty(self):
         return torch.sum(self.l2_interact * torch.sin(2*self.angles)**2)
