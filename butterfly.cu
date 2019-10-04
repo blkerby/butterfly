@@ -43,8 +43,22 @@ __device__ scalar_t reduce_add_block(scalar_t x, scalar_t *s_tmp) {
     return x;
 }
 
-#if __CUDA_ARCH__ < 600
-__device__ double atomicAddLegacy(double* address, double val)
+__device__ void reduce_add_global(float x, float *s_tmp, float *g_out) {
+    x = reduce_add_block(x, s_tmp);
+    if (threadIdx.x == 0) {
+        atomicAdd(g_out, x);
+    }
+}
+
+#if __CUDA_ARCH__ >= 600
+__device__ void reduce_add_global(double x, double *s_tmp, double *g_out) {
+    x = reduce_add_block(x, s_tmp);
+    if (threadIdx.x == 0) {
+        atomicAdd(g_out, x);
+    }
+}
+#else
+__device__ double atomicAddDouble(double* address, double val)
 {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
     unsigned long long int old = *address_as_ull, assumed;
@@ -55,17 +69,14 @@ __device__ double atomicAddLegacy(double* address, double val)
     } while (assumed != old);
     return __longlong_as_double(old);
 }
-#endif
 
-template <typename scalar_t>
-__device__ void reduce_add_global(scalar_t x, scalar_t *s_tmp, scalar_t *g_out) {
+__device__ void reduce_add_global(double x, double *s_tmp, double *g_out) {
     x = reduce_add_block(x, s_tmp);
-#if __CUDA_ARCH__ < 600
-    atomicAddLegacy(g_out, x);
-#else
-    atomicAdd(g_out, x);
-#endif
+    if (threadIdx.x == 0) {
+        atomicAddDouble(g_out, x);
+    }
 }
+#endif
 
 
 // Saturates the GPU global memory bandwidth with very low utilization of the ALUs. 

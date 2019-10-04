@@ -3,42 +3,6 @@ import torch.nn
 import torch.utils.cpp_extension
 import math
 
-# TODO: Use setup.py instead of JIT loading
-cuda_butterfly = torch.utils.cpp_extension.load(
-    name="butterfly", 
-    sources=["butterfly.cpp", "butterfly.cu"],
-    extra_cuda_cflags=['-Xcompiler', '-O3', '-Xptxas', '-O3', '--gpu-code=compute_30', 
-    '--gpu-architecture=compute_30', '-Xptxas', '--warn-on-spills', '-Xptxas', '--warn-on-local-memory-usage'])
-
-
-# TODO: combine CPU and CUDA versions into one class (also implement optimized CPU version in C++)
-class OrthogonalButterflyLayerCUDA(torch.nn.Module):
-    def __init__(self, width_pow, l2_interact, dtype=torch.float):
-        super().__init__()
-        self.dtype = dtype
-        self.width_pow = width_pow
-        self.width = 2**width_pow
-        self.half_width = 2**(width_pow - 1)
-        self.depth = depth
-        self.l2_interact = l2_interact
-        initial_params = torch.rand(self.half_width, depth, dtype=dtype) * math.pi * 2
-        self.params = torch.nn.Parameter(initial_params)
-        self.perm = torch.zeros([self.width], dtype=torch.long)
-        for i in range(self.width):
-            if i % 2 == 0:
-                self.perm[i] = i // 2
-            else:
-                self.perm[i] = i // 2 + self.half_width
-
-    def forward(self, X):
-        assert X.dtype == self.dtype
-        input_width = X.shape[1]
-        X = torch.cat([X, torch.zeros([X.shape[0], self.width - X.shape[1]], dtype=X.dtype)], dim=1)
-        out = torch.empty_like(X)
-        cuda_butterfly.butterfly_forward_slow(X, out, self.params.data)
-        return out
-
-
 class OrthogonalButterfly(torch.nn.Module):
     def __init__(self, width_pow, depth, l2_interact, dtype=torch.float):
         super().__init__()
