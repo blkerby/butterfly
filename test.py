@@ -2,11 +2,11 @@ import torch
 import torch.autograd
 from butterfly_cuda import OrthogonalButterfly, OrthogonalButterflyLayerFunction
 
-dtype = torch.float64
+dtype = torch.float32
 n = 16
 device = torch.device('cuda')
-
-X = torch.rand(n, 256, dtype=dtype, device=device)
+torch.random.manual_seed(0)
+X = torch.rand(n, 65536, dtype=dtype, device=device)
 perm = torch.randperm(n)
 perm = perm[perm]
 target = X[perm, :]
@@ -18,14 +18,14 @@ def loss(pred, target):
 #     (X, angles), eps=1e-6, atol=1e-4)
 
 model = OrthogonalButterfly(
-    width_pow=5, 
-    depth=8,
+    width_pow=8, 
+    depth=24,
     l2_interact=0.0, 
     dtype=dtype,
     device=device
 )
 
-optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=20, tolerance_grad=1e-15, tolerance_change=1e-15, history_size=100, line_search_fn='strong_wolfe')
+optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=1, tolerance_grad=1e-15, tolerance_change=1e-15, history_size=100, line_search_fn='strong_wolfe')
 # optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 last_obj = float("Inf")
 last_gn = float("Inf")
