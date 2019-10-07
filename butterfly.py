@@ -5,7 +5,8 @@ import torch.autograd
 import torch.nn
 import math
 import matplotlib.pyplot as plt
-
+from sr1_optimizer import SR1Optimizer
+from agd_optimizer import AGDOptimizer
 
 def compute_loss(pY, Y):
     err = pY - Y
@@ -23,8 +24,8 @@ def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=torch.float) - 0.5) * scale
     # Y = torch.cos(X)
     # Y = X * torch.sin(1 / X)
-    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
-    # Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X)))
+    # Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X)))
     # Y_true = torch.where(X > 0.2, torch.full_like(X, 1.0), torch.full_like(X, -1.0))
     Y = Y_true + noise * torch.randn([N, 1], dtype=torch.float)
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
@@ -276,7 +277,7 @@ class ThreeParameterFamily(torch.nn.Module):
         self.l2_slope = l2_slope
         self.l2_scale = l2_scale
         self.l2_bias = l2_bias
-        eps = 0.01
+        eps = 0.1
         self.bias = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps)
         self.slope = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
         self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
@@ -318,14 +319,14 @@ class CustomNetwork(torch.nn.Module):
         self.butterfly_layers = []
         self.activation_layers = []
         self.all_layers = []
-        self.bias = torch.nn.Parameter(torch.tensor([0.0], dtype=dtype))
-        self.scale = torch.nn.Parameter(torch.tensor([1.0], dtype=dtype))
+        # self.bias = torch.nn.Parameter(torch.tensor([0.0], dtype=dtype))
+        # self.scale = torch.nn.Parameter(torch.tensor([1.0], dtype=dtype))
         for i in range(depth):
             butterfly = OrthogonalButterfly(width_pow, butterfly_depth, l2_interact, dtype=dtype)
             # activation = CompactSmoothSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
-            # activation = QuinticSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
+            activation = QuinticSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
             # activation = CubicSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
-            activation = QuadraticSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
+            # activation = QuadraticSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
             # activation = SmoothSquashActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
             # activation = AsinhActivation(self.width, l2_slope, l2_scale, l2_bias, dtype=dtype)
             # activation = KernelActivation(self.width, l2_slope, dimension=32, range=2.0, dtype=dtype)
@@ -342,7 +343,7 @@ class CustomNetwork(torch.nn.Module):
         assert X.dtype == self.dtype
         assert X.shape[1] == self.num_inputs
         X_in = torch.cat([X, torch.zeros([X.shape[0], self.width - self.num_inputs], dtype=self.dtype)], axis=1)
-        return self.sequential.forward(X_in)[:, :self.num_outputs] * self.scale + self.bias
+        return self.sequential.forward(X_in)[:, :self.num_outputs] #* self.scale + self.bias
 
     def penalty(self):
         # total = self.l2_slope * (self.scale - 1) ** 2
@@ -422,10 +423,10 @@ class CustomNetwork(torch.nn.Module):
 
 N = 200
 # scale = 25
-scale = 10
+scale = 5
 seed = 4
-# dtype = torch.double
-dtype = torch.float
+dtype = torch.double
+# dtype = torch.float
 
 torch.random.manual_seed(seed)
 
@@ -437,12 +438,12 @@ X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 model = CustomNetwork(
     num_inputs=1,
     num_outputs=1,
-    width_pow=3,
+    width_pow=4,
     depth=3,
-    butterfly_depth=3,
-    l2_slope=1e-3,#2e-2, #1e-3,#1e-8, #0.0000005, #0.0001,
+    butterfly_depth=4,
+    l2_slope=1e-6,#2e-2, #1e-3,#1e-8, #0.0000005, #0.0001,
     # l2_slope=0.000001, #0.0001,
-    l2_scale=1e-6,#2e-3, #1e-2, #1e-2, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
+    l2_scale=1e-3,#2e-3, #1e-2, #1e-2, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
     l2_bias=0, #1e-6,
     l2_interact=0,#1e-4, #1e-5, #0.0001, #0.0001,
     dtype=dtype
@@ -464,9 +465,10 @@ model = CustomNetwork(
 # )
 
 
-
-optimizer = torch.optim.LBFGS(model.parameters(), lr=0.5, max_iter=10, max_eval=20, history_size=100, tolerance_grad=0, tolerance_change=0,
-                              line_search_fn='strong_wolfe')
+# optimizer = AGDOptimizer(model.parameters())
+optimizer = SR1Optimizer(model.parameters(), memory=5000)
+# optimizer = torch.optim.LBFGS(model.parameters(), lr=0.5, max_iter=1, max_eval=20, history_size=1000, tolerance_grad=0, tolerance_change=0,
+#                               line_search_fn='strong_wolfe')
 # optimizer =torch.optim.SGD(model.parameters(), lr=0.05, nesterov=True, momentum=0.5)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.025)
 
@@ -492,7 +494,7 @@ for i in range(100000):
 
     optimizer.step(closure)
 
-    if i % 1 == 0:
+    if i % 5 == 0:
         model.zero_grad()
         pY = model(X)
         loss = compute_loss(pY, Y)
@@ -516,18 +518,17 @@ for i in range(100000):
                 plt.scatter(X[:, 0], Y[:, 0], color='black', marker='.', alpha=0.3)
                 fig.canvas.draw()
 
-            # if i % 100 == 0:
-            print("seed {}, iteration {}: obj {}, train {}, true {}, obj grad norm {}".format(
-                seed, i, float(obj), float(loss), float(test_loss), gn))
-            if gn < 1e-7 or (last_loss == loss and last_gn == gn):
-                print("Perturbing")
-                for p in model.parameters():
-                    p += 1e-4 * (torch.rand_like(p) * 2 - 1)
-                #
-                # # if loss < 1e-7:
-                # print("seed {}, iteration {}: obj {}, train {}, true {}, obj grad norm {}".format(
-                #     seed, i, float(obj), float(loss), float(test_loss), gn))
-                # break
+            print("seed={}, iteration={}: obj={}, train={}, true={}, obj grad norm={}, rate={}".format(
+                seed, i, float(obj), float(loss), float(test_loss), gn, optimizer.state['rate']))
+            # if gn < 1e-7 or (last_loss == loss and last_gn == gn):
+            #     print("Perturbing")
+            #     for p in model.parameters():
+            #         p += 1e-4 * (torch.rand_like(p) * 2 - 1)
+            #     #
+            #     # # if loss < 1e-7:
+            #     # print("seed {}, iteration {}: obj {}, train {}, true {}, obj grad norm {}".format(
+            #     #     seed, i, float(obj), float(loss), float(test_loss), gn))
+            #     # break
             last_loss = loss
             last_gn = gn
 
