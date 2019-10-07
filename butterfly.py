@@ -23,8 +23,8 @@ def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=torch.float) - 0.5) * scale
     # Y = torch.cos(X)
     # Y = X * torch.sin(1 / X)
-    # Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
-    Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X)))
+    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    # Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X)))
     # Y_true = torch.where(X > 0.2, torch.full_like(X, 1.0), torch.full_like(X, -1.0))
     Y = Y_true + noise * torch.randn([N, 1], dtype=torch.float)
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
@@ -420,17 +420,17 @@ class CustomNetwork(torch.nn.Module):
 #         return total
 
 
-N = 400
+N = 200
 # scale = 25
-scale = 5
-seed = 1
+scale = 10
+seed = 4
 # dtype = torch.double
 dtype = torch.float
 
 torch.random.manual_seed(seed)
 
 # Generate the data
-X, Y_true, Y = gen_data(N, scale, noise=0.1, dtype=dtype)
+X, Y_true, Y = gen_data(N, scale, noise=0.0, dtype=dtype)
 X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
 # Construct/initialize the model (0.023523079231381416)
@@ -440,10 +440,10 @@ model = CustomNetwork(
     width_pow=3,
     depth=3,
     butterfly_depth=3,
-    l2_slope=1e-3,#1e-8, #0.0000005, #0.0001,
+    l2_slope=1e-3,#2e-2, #1e-3,#1e-8, #0.0000005, #0.0001,
     # l2_slope=0.000001, #0.0001,
-    l2_scale=1e-2, #1e-2, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
-    l2_bias=1e-6,
+    l2_scale=1e-6,#2e-3, #1e-2, #1e-2, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
+    l2_bias=0, #1e-6,
     l2_interact=0,#1e-4, #1e-5, #0.0001, #0.0001,
     dtype=dtype
 )

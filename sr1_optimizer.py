@@ -1,163 +1,115 @@
 import torch
-# from sr1_optimizer_core import SR1OptimizerCore
-from linalg import spectral_update
-
-def project(u, Q):
-    """
-    Project vector u onto the orthogonal complement of the column space of Q (which must have orthonormal columns).
-    """
-    if Q.shape[1] == 0:
-        # Special case here, to work around some PyTorch bugs/limitations in dealing with empty dimensions
-        return u
-    u = u - Q.mv(Q.t().mv(u))
-    u = u - Q.mv(Q.t().mv(u))   # This second iteration greatly improves the numerical stability.
-    return u
 
 
-def obj_subgrad(x, f_grad, penalty):
-    """Returns the minimum-norm subgradient of the objective function. The negative of this is the steepest-descent
-    direction. """
-    g = f_grad + penalty * torch.sign(x)
-    xz = (x == 0)
-    gz = g[xz]
-    g[xz] = torch.sign(gz) * torch.clamp(torch.abs(gz) - penalty[xz], 0)
-    return g
+def stable_norm(u):
+    """Compute the Euclidean norm of a vector `u` in a numerically stable way. We want a non-zero vector to always have
+    a non-zero norm, which, due to the possibility of underflow, is not ensured by the PyTorch function torch.norm() on
+    its own (at least not for the torch.float64 datatype; for torch.float32 this might already be the case, at least in
+    one configuration, but this is undocumented and we do not want to rely on it.)"""
+    m = u.abs().max()
+    if m == 0.0:
+        return m
+    u = u / m
+    return u.norm(2) * m
 
 
-def l1_trust_region(x0, f_grad0, Q, M, lam0, penalty, relax0, max_iter=100, tol=1e-8, obj_tol=1e-12, max_condition_num=None, relax_multiplier=4.0):
-    obj0 = torch.sum(penalty * torch.abs(x0))
-
-    x1 = x0
-    f_grad1 = f_grad0
-    obj1 = obj0
-    obj_subgrad1 = obj_subgrad(x1, f_grad1, penalty)
-    relax1 = relax0
-
-    def f_grad_and_obj_fn(x):
-        dx = x - x0
-        Qdx = torch.mv(Q.t(), dx)
-        odx = project(dx, Q)
-        if M.shape[0] == 0:
-            # Special case here, to work around some PyTorch bugs/limitations in dealing with empty dimensions
-            QMQdx = torch.zeros([Q.shape[0]], dtype=Q.dtype)
-        else:
-            QMQdx = torch.mv(Q, torch.mv(M, Qdx))
-        Hdx = QMQdx + lam0 * odx
-        f_grad = f_grad0 + Hdx
-        obj = torch.dot(dx, f_grad0) + 0.5 * torch.dot(dx, Hdx) + torch.sum(penalty * torch.abs(x))
-        return f_grad, obj
-
-    for i in range(max_iter):
-        # Determine the current active set of variables
-        act = (x1 != 0.0) | (obj_subgrad1 != 0.0)
-        sgn_act = torch.sign(x1[act])
-        sz = x1[act] == 0.0
-        sgn_act[sz] = -torch.sign(obj_subgrad1[act][sz])
-
-        # Determine the spectral decomposition of the Hessian projected to the active set
-        Q_act0 = Q[act, :]
-        if Q_act0.shape[1] == 0:
-            # Special case here, to work around some PyTorch bugs/limitations in dealing with empty dimensions
-            Q_act = torch.zeros_like(Q_act0)
-            # R = torch.zeros([0, 0], dtype=x0.dtype)
-            M1 = torch.zeros([0, 0], dtype=x0.dtype)
-        else:
-            Q_act, R = torch.qr(Q_act0)
-            M1 = torch.mm(R, torch.mm(M - lam0 * torch.eye(M.shape[0], dtype=M.dtype), R.t())) + lam0 * torch.eye(R.shape[0], dtype=R.dtype)
-        eig, _ = M1.symeig()
-        if eig.shape[0] > 0:
-            relax_min = torch.clamp((eig[-1] - max_condition_num * eig[0]) / (max_condition_num - 1), 0.0)
-            relax1 = torch.clamp(relax1, max(relax_min, 1 / max_condition_num))
-
-        M2 = M1 + relax1 * torch.eye(M1.shape[0], dtype=M1.dtype)
-        obj_subgrad1_act = obj_subgrad1[act]
-        orth = project(-obj_subgrad1_act, Q_act)
-        if M2.shape[0] == 0:
-            # Special case here, to work around some PyTorch bugs/limitations in dealing with empty dimensions
-            sol = torch.zeros([0], dtype=M2.dtype)
-        else:
-            Qsd = torch.mv(Q_act.t(), -obj_subgrad1_act)
-            sol = torch.gesv(Qsd.view(-1, 1), M2)[0].view(-1)
-        s_act = torch.mv(Q_act, sol) + 1 / (lam0 + relax1) * orth
-        expected_change = torch.dot(s_act, obj_subgrad1_act + 0.5 * (torch.mv(Q_act, torch.mv(M1, sol)) + lam0 / (lam0 + relax1) * orth))
-        x2_act = x1[act] + s_act
-        # print("Number projected: {}, orth: {}, s_act: {}, del: {}".format(
-        #     torch.sum(torch.sign(x2_act) == -sgn_act), orth.norm(2), s_act.norm(2), x2_act - x1[act]))
-        num_proj = torch.sum(torch.sign(x2_act) == -sgn_act)
-
-        x2_act[torch.sign(x2_act) == -sgn_act] = 0.0
-        x2 = torch.zeros_like(x1)
-        x2[act] = x2_act
-
-        f_grad2, obj2 = f_grad_and_obj_fn(x2)
-        obj_subgrad2 = obj_subgrad(x2, f_grad2, penalty)
-
-        # Update the relaxation parameter (for the next relaxed-Newton step) based on how good the current step was:
-        if (obj2 - obj1 >= 0.75 * expected_change):
-            relax1 = relax1 * relax_multiplier
-        elif (obj2 - obj1 <= 0.95 * expected_change):
-            relax1 = relax1 / relax_multiplier
-        # else:
-        #     relax2 = relax1 + torch.dot(obj_subgrad2[act], s_act) / torch.dot(s_act, s_act) #* relax_ratio
-        #     relax1 = relax2.clamp(max(relax_min, relax1 / relax_multiplier), relax1 * relax_multiplier)
-
-        # print("Expected: {}, Actual: {}, Num projected={}".format(expected_change, obj2 - obj1, num_proj))
-        if obj2 - obj1 < obj_tol:
-            x1 = x2
-            obj1 = obj2
-            obj_subgrad1 = obj_subgrad2
-
-        nm = obj_subgrad1.norm(2)
-        # print("Iteration={}, obj={}, subgrad={}, active={}, x1={}, relax={}".format(
-        #     i, obj1.item(), nm.item(), torch.sum(x1 != 0.0).item(), x1.norm(2).item(), relax1))
-        if nm < tol:
-            return x1, obj1 - obj0
+def eps(dtype):
+    if dtype == torch.float64:
+        return 1e-15
+    elif dtype == torch.float32:
+        return 1e-6
     else:
-        raise RuntimeError("l1_trust_region failed to converge")
+        raise RuntimeError("Unexpected dtype: {}".format(dtype))
 
-# # for k in range(100):
-# dtype = torch.float64
-# n = 100
-# m = 10
-# Q = torch.randn([n, m], dtype=dtype).qr()[0]
-# relax = 100000
-# M = (torch.diag(torch.tensor(range(m), dtype=dtype) + 1) / m) ** 3 + relax * torch.eye(M.shape[0], dtype=dtype)
-#
-# # M = (torch.diag(torch.tensor(range(m), dtype=dtype) + 1) / m)
-# # f_grad0 = torch.randn(n, dtype=dtype)
-# f_grad0 = torch.randn(n, dtype=dtype) ** 2
-# # x0 = torch.zeros_like(f_grad0)
-# x0 = torch.randn(n, dtype=dtype)
-# penalty = torch.full_like(x0, 0.5)
-# lam0 = 1.0
-#
-# x1, ec = l1_trust_region(x0, f_grad0, Q, M, lam0 + relax, penalty, relax0=torch.tensor(0.1, dtype=torch.float64), max_iter=10000, relax_multiplier=4.0, tol=1e-8, max_condition_num=1e8)
-# # print((x1 - x0).norm(2))
+
+def expand_Q(Q, u, k, max_iter=3):
+    """Given a matrix `Q`, considered as only defined on its first k columns (the remaining columns being assumed to
+    be unallocated memory), which are assumed to be orthonormal, modify Q by possibly adding a new column (in place,
+    by replacing its (k+1)st column) with a new unit-length column orthogonal to the first `k` columns, determining a
+    vector `r` (of length `k` or `k+1`) such that after this operation `Q*r = u`. The situation where `r` has length `k`
+    would be when `u` is already numerically equal to a linear combination of the columns of `Q` (in particular this
+    happens if `Q` is square.).
+    """
+    Q0 = Q[:, :k]
+    nm0 = stable_norm(u)
+
+    # Subtract away from `u` its projection onto the columns of `Q`; the new value of `u` will then be approximately
+    # orthogonal to the columns of `Q`.
+    r = Q0.t().mv(u)
+    if Q0.shape[0] == k:
+        # `Q` is already square, so we already have the required `r` without needing to add a column to `Q` (and
+        # in any case it would be impossible to add a column while retaining orthonormality)
+        return r
+    u = u - Q0.mv(r)
+
+    nm1 = nm0
+    for i in range(max_iter):
+        nm2 = stable_norm(u)
+        if nm2 >= 0.5 * nm1:
+            break
+        elif nm2 <= eps(u.dtype) * nm0:
+            # The original `u` was numerically already equal to a linear combination of the columns of `Q`, so there is no
+            # need to add another column (and adding `u1` as a column would risk destroying the orthonormality of `Q`).
+            return r
+        # For numerical stability we subtract away the projection of `u` onto the columns `Q` again. This is based
+        # on a similar idea to the Modified Gram-Schmidt method, except this way is faster and more accurate. This is
+        # important to do, since otherwise in certain cases the orthonormality of `Q` could be completely ruined
+        # (e.g., see https://fgiesen.wordpress.com/2013/06/02/modified-gram-schmidt-orthogonalization/)
+        r1 = Q0.t().mv(u)
+        u -= Q0.mv(r1)
+        r += r1
+        nm1 = nm2
+    else:
+        raise RuntimeError("expand_Q failed to converge")
+
+    u /= nm2
+    Q[:, k] = u
+    r = torch.cat([r, nm2.view(-1)])
+    return r
+
+def spectral_update(Q, M, lam0, u, c, k):
+    """
+    Given
+    - a matrix `Q`, considered as only defined on its first k columns (the remaining columns being assumed to
+    be unallocated memory), which are assumed to be orthonormal
+    - a square matrix `M`, considered as only defined on its first k rows and columns
+    - a vector `u` having the same number of entries as `Q` has rows
+    - scalars `lam0` and `c`
+    determines matrices `Q1` and `M1` such that
+        Q1*M1*Q1^T + lam0*(I - Q1*Q1^T) = Q*M*Q^T + lam0*(I - Q*Q^T) + c*u*u^T
+    `Q` are `M` are modified in place so that they are replaced with `Q1` and `M1` respectively.
+    """
+    r = expand_Q(Q, u, k)
+    m = r.shape[0]
+    if m > k:
+        M[k, :] = 0.0
+        M[:, k] = 0.0
+        M[k, k] = lam0
+    M[:m, :m].add_(c, torch.ger(r, r))
+    return m
 
 class SR1Optimizer(torch.optim.Optimizer):
-    def __init__(self, params, penalty=0.0, lam0=0.0, relax=1.0, relax_multiplier=5, memory=10, obj_tol=None, max_condition_num=None):
-        defaults = {'penalty': penalty }
-        super().__init__(params, defaults)
+    def __init__(self, params, lam0=1.0, relax=1.0, relax_multiplier=5, memory=10, f_tol=None, max_condition_num=None):
+        super().__init__(params, {})
         self._dtype = self.param_groups[0]['params'][0].data.dtype
         self._numel = sum(p.numel() for group in self.param_groups for p in group['params'])
 
         self.state['x'] = None
         self.state['f'] = None
-        self.state['f_grad'] = None
-        self.state['obj'] = None
-        self.state['obj_subgrad'] = None
+        self.state['grad'] = None
         self.state['lam0'] = torch.tensor(lam0, dtype=self._dtype)
         self.state['relax'] = torch.tensor(relax, dtype=self._dtype)
         self.state['relax_multiplier'] = torch.tensor(relax_multiplier, dtype=self._dtype)
-        self.state['Q'] = torch.zeros([self._numel, 0], dtype=self._dtype)
-        self.state['M'] = torch.zeros([0, 0], dtype=self._dtype)
+        self.state['Q_buf'] = torch.zeros([self._numel, memory], dtype=self._dtype)
+        self.state['M_buf'] = torch.zeros([memory, memory], dtype=self._dtype)
+        self.state['k'] = 0
         self.state['memory'] = memory
-        if obj_tol is not None:
-            self.state['obj_tol'] = obj_tol
+        if f_tol is not None:
+            self.state['f_tol'] = f_tol
         elif self._dtype == torch.float64:
-            self.state['obj_tol'] = 1e-14
+            self.state['f_tol'] = 1e-14
         else:
-            self.state['obj_tol'] = 1e-6
+            self.state['f_tol'] = 1e-6
         if max_condition_num is None:
             if self._dtype == torch.float64:
                 max_condition_num = 1e12
@@ -183,15 +135,6 @@ class SR1Optimizer(torch.optim.Optimizer):
         assert g.numel() == self._numel  # Make sure that the number of parameters is unchanged since initialization
         return g
 
-    def _gather_penalty(self):
-        tensors = []
-        for group in self.param_groups:
-            for p in group['params']:
-                tensors.append(torch.full_like(p.data.view(-1), group['penalty']))
-        x = torch.cat(tuple(tensors))
-        assert x.numel() == self._numel  # Make sure that the number of parameters is unchanged since initialization
-        return x
-
     def _update_params(self, x):
         offset = 0
         for group in self.param_groups:
@@ -204,58 +147,59 @@ class SR1Optimizer(torch.optim.Optimizer):
     def _eval(self, x, closure):
         self._update_params(x)
         f = closure()
-        penalty = self._gather_penalty()
-        obj = f + torch.sum(penalty * torch.abs(x))
-        f_grad = self._gather_grad()
-        obj_subgrad0 = obj_subgrad(x, f_grad, penalty)
-        return f, obj, f_grad, obj_subgrad0
+        grad = self._gather_grad()
+        return f, grad
 
     def step(self, closure):
-        Q = self.state['Q']
-        M = self.state['M']
+        Q_buf = self.state['Q_buf']
+        M_buf = self.state['M_buf']
+        k = self.state['k']
+        Q = Q_buf[:, :k]
+        M = M_buf[:k, :k]
+        f_tol = self.state['f_tol']
         lam0 = self.state['lam0']
-        obj_tol = self.state['obj_tol']
         relax = self.state['relax']
         relax_multiplier = self.state['relax_multiplier']
         max_condition_num = self.state['max_condition_num']
         if self.state['x'] is not None:
             x0 = self.state['x']
             f0 = self.state['f']
-            obj0 = self.state['obj']
-            f_grad0 = self.state['f_grad']
-            obj_subgrad0 = self.state['obj_subgrad']
+            grad0 = self.state['grad']
         else:
             x0 = self._gather_params()
-            f0, obj0, f_grad0, obj_subgrad0 = self._eval(x0, closure)
+            f0, grad0 = self._eval(x0, closure)
 
-        # # To determine where we should evaluate the function next, use the trust-region method to find the minimum of
-        # # the current quadratic model of the function restricted to a ball of radius `self.trust_radius` centered at
-        # # the current point `self.x0`.
+        # To determine where we should evaluate the function next, we use the relaxed-Newton method to find the minimum
+        # of the current quadratic model of the function restricted to a ball of some radius (depending on the
+        # parameter `relax`) of the the current point `x0`.
         eig, U = torch.symeig(M, eigenvectors=True)
         if eig.shape[0] > 0:
-            # lam0 = (lam0 + torch.median(eig)) / 2
             lam0 = (lam0 + torch.median(eig)) / 2
-        penalty = self._gather_penalty()
-
-        if eig.shape[0] > 0:
-            relax_min = torch.clamp((eig[-1] - max_condition_num * eig[0]) / (max_condition_num - 1), 0.0)
+            max_eig = max(lam0, eig[-1])
+            min_eig = min(lam0, eig[0])
+            relax_min = torch.clamp((max_eig - max_condition_num * min_eig) / (max_condition_num - 1), 0.0)
         else:
             relax_min = 0.0
-            # relax = torch.clamp(relax, max(relax_min, 1 / max_condition_num))
 
-        M1 = M + (relax + relax_min) * torch.eye(M.shape[0], dtype=M.dtype)
-        # print("symeig: ",M1.symeig()[0])
-        x1, expected_change = l1_trust_region(x0, f_grad0, Q, M1, lam0 + relax_min + relax, penalty, relax, max_condition_num=max_condition_num, tol=1e-8, max_iter=10000)
-        s = x1 - x0
+        r = max(relax, relax_min)
+        # r = 0.0  # TODO: remove this
+        eig_r = eig + r
+        Qtg = torch.mv(Q.t(), grad0)
+        UQtg = torch.mv(U.t(), Qtg)
+        IUQtg = UQtg / eig_r
+        pg = grad0 - torch.mv(Q, Qtg)
+        cf = 1 / (lam0 + r)
+        s = -torch.mv(Q, torch.mv(U, IUQtg)) - cf * pg
+        expected_change = -torch.dot(UQtg, (eig / 2 + r) / eig_r ** 2 * UQtg) - (lam0 / 2 + r) / (lam0 + r) ** 2 * torch.sum(pg ** 2)
+        x1 = x0 + s
 
         # Evaluate the function and its gradient at the new point
-        f1, obj1, f_grad1, obj_subgrad1 = self._eval(x1, closure)
+        f1, grad1 = self._eval(x1, closure)
 
-        # logging.info("x0: {}, x1: {}, x1-x0: {}, s: {}, lam0: {}, M1: {}".format(x0.norm(2), x1.norm(2), (x1 - x0).norm(2), s.norm(2), lam0, M1))
-
+        print("change={}, expected={}".format(f1 - f0, expected_change))
 
         # Update our quadratic model of the function, by an SR1 update.
-        y = f_grad1 - f_grad0
+        y = grad1 - grad0
         Qts = Q.t().mv(s)
         ps = s - Q.mv(Qts)
         Bs = Q.mv(M.mv(Qts)) + lam0 * ps
@@ -263,35 +207,59 @@ class SR1Optimizer(torch.optim.Optimizer):
         us = torch.dot(u, s)
         uu = torch.dot(u, u)
         ss = torch.dot(s, s)
-        if us * us > 1e-16 * uu * ss:
-            c = 1. / torch.dot(u, s)
-            Q, M = spectral_update(Q, M, lam0, u, c)
+        if us * us > eps(self._dtype) * uu * ss:
+            c = 1 / us
+            k = spectral_update(Q_buf, M_buf, lam0, u, c, k)
         else:
             print("Skipping SR1 update")
-        # print("Step size={} out of {}".format(s.norm(2), self.trust_radius))
 
         # Update the relaxation parameter (for the next relaxed-Newton step) based on how good the current step was:
-
-        if (obj1 - obj0 >= 0.75 * expected_change):
+        if (f1 - f0 >= 0.75 * expected_change):
             relax = relax * relax_multiplier
-        elif (obj1 - obj0 <= 0.95 * expected_change):
+        elif (f1 - f0 <= 0.95 * expected_change and relax != relax_min):
             relax = relax / relax_multiplier
-        # logging.info("Expected: {}, Actual: {}".format(expected_change, obj1 - obj0))
-        if obj1 > obj0 + obj_tol:
+        if f1 > f0 + f_tol:
             # The new point is worse than the old one, so we reject it.
+            print("Rejecting step")
             x1 = x0
             f1 = f0
-            f_grad1 = f_grad0
-            obj1 = obj0
-            obj_subgrad1 = obj_subgrad0
+            grad1 = grad0
             self._update_params(x0)
 
         self.state['x'] = x1
         self.state['f'] = f1
-        self.state['f_grad'] = f_grad1
-        self.state['obj'] = obj1
-        self.state['obj_subgrad'] = obj_subgrad1
-        self.state['Q'] = Q
-        self.state['M'] = M
+        self.state['grad'] = grad1
+        self.state['k'] = k
         self.state['lam0'] = lam0
         self.state['relax'] = relax
+
+
+# n = 4
+# dtype = torch.double
+# A = 2 * torch.eye(n, dtype=dtype) + torch.rand([n, n], dtype=dtype)
+# A = A + A.t()
+# g0 = torch.rand([n], dtype=dtype)
+#
+# class TestModule(torch.nn.Module):
+#     def __init__(self):
+#         super().__init__()
+#         self.x = torch.nn.Parameter(torch.rand([n], dtype=dtype))
+#
+# model = TestModule()
+# optimizer = SR1Optimizer(model.parameters())
+#
+# def closure():
+#     model.zero_grad()
+#     Ax = torch.mv(A, model.x)
+#     obj = torch.dot(0.5 * Ax + g0, model.x)
+#     obj.backward()
+#     return obj
+#
+# obj = closure()
+# print("obj={}, x={}, grad={}".format(obj, model.x, model.x.grad))
+# optimizer.step(closure)
+# print("obj={}, x={}, grad={}, relax={}".format(obj, model.x, model.x.grad, optimizer.state['relax']))
+#
+#
+# Q = optimizer.state['Q_buf'][:, :4]
+# M = optimizer.state['M_buf'][:4, :4]
