@@ -110,9 +110,9 @@ class SR1Optimizer(torch.optim.Optimizer):
         y = grad1 - grad0
         # print("rel grad: {}, rel step: {}".format(torch.norm(y) / (torch.norm(grad1) + torch.norm(grad0)),
         #                                           torch.norm(s) / (torch.norm(x0) + torch.norm(x1))))
-        sn = stable_norm(s)
-        s /= sn
-        y /= sn
+        # sn = stable_norm(s)
+        # s /= sn
+        # y /= sn
         Qts = Q.t().mv(s)
         ps = s - Q.mv(Qts)
         Bs = Q.mv(M.mv(Qts)) + lam0 * ps
