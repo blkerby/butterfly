@@ -1,9 +1,10 @@
 import torch
+import math
 from linalg import spectral_update, stable_norm, eps
 from trust_region import trust_region_solve
 
 class SR1Optimizer(torch.optim.Optimizer):
-    def __init__(self, params, lam0=1.0, tr_radius=1.0, tr_growth=4.0, tr_factor=10.0, memory=10, f_tol=None):
+    def __init__(self, params, lam0=1.0, tr_radius=0.1, tr_growth=1.5, memory=10, f_tol=None):
         super().__init__(params, {})
         self._dtype = self.param_groups[0]['params'][0].data.dtype
         self._numel = sum(p.numel() for group in self.param_groups for p in group['params'])
@@ -14,7 +15,6 @@ class SR1Optimizer(torch.optim.Optimizer):
         self.state['lam0'] = torch.tensor(lam0, dtype=self._dtype)
         self.state['tr_radius'] = torch.tensor(tr_radius, dtype=self._dtype)
         self.state['tr_growth'] = torch.tensor(tr_growth, dtype=self._dtype)
-        self.state['tr_factor'] = torch.tensor(tr_factor, dtype=self._dtype)
         self.state['Q_buf'] = torch.zeros([self._numel, memory], dtype=self._dtype)
         self.state['M_buf'] = torch.zeros([memory, memory], dtype=self._dtype)
         self.state['k'] = 0
@@ -69,7 +69,6 @@ class SR1Optimizer(torch.optim.Optimizer):
         lam0 = self.state['lam0']
         tr_radius = self.state['tr_radius']
         tr_growth = self.state['tr_growth']
-        tr_factor = self.state['tr_factor']
         if self.state['x'] is not None:
             x0 = self.state['x']
             f0 = self.state['f']
@@ -98,40 +97,71 @@ class SR1Optimizer(torch.optim.Optimizer):
         tg[1:] = UQtg
         ts = trust_region_solve(td, tg, tr_radius)
         s = ts[0] * ug0 + torch.mv(Q, torch.mv(U, ts[1:]))
+        step = s
+        expected_change = torch.dot(ts, tg) + 0.5 * torch.sum(td * ts ** 2)
         x1 = x0 + s
 
+        # print("step ratio: {}".format(torch.norm(step) / tr_radius))
         # Evaluate the function and its gradient at the new point
         f1, grad1 = self._eval(x1, closure)
+        # print("Expected change: {}, actual: {}".format(expected_change, f1 - f0))
 
         # Update our quadratic model of the function, by an SR1 update.
         y = grad1 - grad0
+        # print("rel grad: {}, rel step: {}".format(torch.norm(y) / (torch.norm(grad1) + torch.norm(grad0)),
+        #                                           torch.norm(s) / (torch.norm(x0) + torch.norm(x1))))
+        sn = stable_norm(s)
+        s /= sn
+        y /= sn
         Qts = Q.t().mv(s)
         ps = s - Q.mv(Qts)
         Bs = Q.mv(M.mv(Qts)) + lam0 * ps
-        u = y - Bs
-        us = torch.dot(u, s)
-        uu = torch.dot(u, u)
-        ss = torch.dot(s, s)
-        if us * us > 1e-12 * uu * ss:
-            c = 1 / us
-            k = spectral_update(Q_buf, M_buf, lam0, u, c, k)
+        u = Bs - y
+        if len(eig) > 0:
+            self.state['max_eig'] = float(eig[-1])
+            self.state['min_eig'] = float(eig[0])
+            max_eig = max(lam0, abs(float(eig[0])), float(eig[-1]))
         else:
-            print("Skipping SR1 update")
+            max_eig = lam0
+        nm = stable_norm(u)
+        u /= nm
+        s /= nm
+        us = torch.dot(u, s)
 
-        # Update the trust-radius
-        g0s = torch.dot(grad0, s)
-        g1s = torch.dot(grad1, s)
-        tr_radius = torch.norm(s) * torch.clamp(-g0s / (g1s - g0s) * tr_growth, 1 / tr_factor, tr_factor)
+        update_limit = max_eig
+        c = torch.clamp(-1.0 / us, -update_limit, update_limit)
+        # if abs(c) == update_limit:
+        #     print("Clamping SR1 update: max_eig={}, c={}".format(max_eig, c))
 
-        if f1 > f0 + f_tol:
-            # The new point is worse than the old one, so we reject it.
-            tr_radius /= tr_factor
+        # mu = max_eig * 2
+        # t = torch.sum(u ** 2) - mu * us
+        # if t >= 0:
+        #     lam1 = (-mu + math.sqrt(mu ** 2 + 4 * t)) / 2
+        #     lam0 += lam1
+        #     M.add_(lam1, torch.eye(M.shape[0], dtype=M.dtype))
+        #     u += lam1 * s
+        #     us = torch.dot(u, s)
+        #     # print("Increasing Hessian diagonal by {} (max_eig={}): us={}".format(lam1, max_eig, us))
+
+        # c = -1.0 / us
+        k = spectral_update(Q_buf, M_buf, lam0, u, c, k)
+
+        # # Update the trust-radius
+        # g0s = torch.dot(grad0, s)
+        # g1s = torch.dot(grad1, s)
+        # tr_radius = tr_radius * torch.clamp(-g0s / (g1s - g0s) * tr_growth, 1 / tr_factor, tr_factor)
+        actual_change = f1 - f0
+        # print("actual change: {}, expected: {}".format(actual_change, expected_change))
+        if actual_change < expected_change * 0.99:
+            tr_radius = torch.norm(step) * tr_growth
+        elif actual_change > expected_change * 0.9:
+            tr_radius = torch.norm(step) / tr_growth
+        if actual_change > f_tol * f0:
+            # print("Rejecting step")
             x1 = x0
             f1 = f0
             grad1 = grad0
             self._update_params(x0)
-        else:
-            tr_radius *= tr_growth
 
         self.state['x'] = x1
         self.state['f'] = f1
