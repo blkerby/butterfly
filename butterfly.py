@@ -24,9 +24,9 @@ def compute_objective(model, loss):
 def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=torch.float) - 0.5) * scale
     # Y = torch.cos(X)
-    # Y = X * torch.sin(1 / X)
-    # Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
-    Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X)))
+    # Y_true = X * torch.sin(1 / X)
+    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    # Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
     # Y_true = torch.where(X > 0.2, torch.full_like(X, 1.0), torch.full_like(X, -1.0))
     Y = Y_true + noise * torch.randn([N, 1], dtype=torch.float)
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
@@ -204,19 +204,19 @@ class QuinticSquashActivation(torch.nn.Module):
         eps = 0.01
         self.bias = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps)
         self.slope = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
-        # self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
-        self.scale = 1.0
+        self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        # self.scale = 1.0
 
     def forward(self, X):
         assert X.dtype == self.dtype
         u = torch.clamp((X * self.slope - self.bias) / self.scale, -1, 1)
-        return self.scale * (1.875 * u - 1.25 * u ** 3 + 0.375 * u ** 5)
-        # return self.scale * u
+        # return self.scale * (1.875 * u - 1.25 * u ** 3 + 0.375 * u ** 5)
+        return self.scale * u
 
     def penalty(self):
         return torch.sum(self.l2_slope * (self.slope - 1) ** 2) + \
+               torch.sum(self.l2_scale * (self.scale) ** 2) + \
                torch.sum(self.l2_bias * self.bias ** 2)
-# torch.sum(self.l2_scale * (self.scale) ** 2) + \
 
 
 class ThreeParameterFamily(torch.nn.Module):
@@ -229,8 +229,9 @@ class ThreeParameterFamily(torch.nn.Module):
         eps = 0.1
         self.bias = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps)
         self.slope = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
-        # self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
-        self.scale = 1.0
+        self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        # self.scale = 1.0
+        # self.slope = torch.tensor(1.0)
 
     def forward(self, X):
         assert X.dtype == self.dtype
@@ -242,9 +243,9 @@ class ThreeParameterFamily(torch.nn.Module):
         pass
 
     def penalty(self):
-        return torch.sum(self.l2_slope * (self.slope - 1) ** 2) + \
-               torch.sum(self.l2_bias * self.bias ** 2)
-#                torch.sum(self.l2_scale * (self.scale) ** 2) + \
+        return torch.sum(self.l2_slope * (self.slope) ** 2) + \
+               torch.sum(self.l2_bias * self.bias ** 2) + \
+               torch.sum(self.l2_scale * (self.scale) ** 2)
 
 
 class QuadraticSquashActivation(ThreeParameterFamily):
@@ -275,6 +276,46 @@ class SquashFunction(torch.autograd.Function):
         return (8 * u / (1 + u) ** 2 * (1 + y2) / (1 - y2) ** 2 * g, None)
 
 
+class BumpFamily(torch.nn.Module):
+    def __init__(self, width, l2_slope, l2_scale, l2_bias, dtype=torch.float):
+        super().__init__()
+        self.dtype = dtype
+        self.l2_slope = l2_slope
+        self.l2_scale = l2_scale
+        self.l2_bias = l2_bias
+        eps = 0.1
+        self.bias_1 = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps)
+        self.bias_2 = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps)
+        self.slope_1 = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        self.slope_2 = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        self.scale_1 = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        self.scale_2 = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        # self.scale_1 = torch.full_like(self.bias_1.data, 1.0)
+        # self.scale_2 = torch.full_like(self.bias_1.data, 1.0)
+
+    def forward(self, X):
+        assert X.dtype == self.dtype
+        u1 = X * self.slope_1 + self.bias_1
+        u2 = X * self.slope_2 + self.bias_2
+        return self.scale_1 * self.base_activation(u1) - self.scale_2 * self.base_activation(u2)
+
+    @abstractmethod
+    def base_activation(self, x):
+        pass
+
+    def penalty(self):
+        return torch.sum(self.l2_slope * (self.slope_1 ** 2 + self.slope_2 ** 2)) + \
+               torch.sum(self.l2_bias * (self.bias_1 ** 2 + self.slope_2 ** 2)) + \
+               torch.sum(self.l2_scale * (self.scale_1 ** 2 + self.scale_2 ** 2))
+
+
+
+class QuadraticBumpActivation(BumpFamily):
+    def base_activation(self, x):
+        u = torch.clamp(x, -1, 1)
+        return u - 0.5 * (u * torch.abs(u) - 1)
+
+
 class CompactSmoothSquashActivation(torch.nn.Module):
     def __init__(self, width, l2_slope, l2_scale, l2_bias, dtype=torch.float):
         super().__init__()
@@ -285,8 +326,8 @@ class CompactSmoothSquashActivation(torch.nn.Module):
         eps = 0.01
         self.bias = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps)
         self.slope = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
-        # self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
-        self.scale = 1.0
+        self.scale = torch.nn.Parameter(torch.rand([width], dtype=dtype) * 2 * eps - eps + 1)
+        # self.scale = 1.0
 
     def forward(self, X):
         assert X.dtype == self.dtype
@@ -308,8 +349,8 @@ class CompactSmoothSquashActivation(torch.nn.Module):
 
     def penalty(self):
         return torch.sum(self.l2_slope * (self.slope - 1) ** 2) + \
-                torch.sum(self.l2_bias * self.bias ** 2)
-# torch.sum(self.l2_scale * (self.scale) ** 2) + \
+                torch.sum(self.l2_bias * self.bias ** 2) + \
+                torch.sum(self.l2_scale * (self.scale) ** 2)
 
 
 class CustomNetwork(torch.nn.Module):
@@ -435,15 +476,38 @@ class FullyConnectedNetwork(torch.nn.Module):
         return total
 
 
+class DynamicRotation(torch.nn.Module):
+    def __init__(self, width, l2_scale):
+        super().__init__()
+        self.width = width
+        self.groups = width // 3
+        self.l2_scale = l2_scale
+        eps = 0.1
+        self.bias = torch.nn.Parameter(torch.rand([self.groups], dtype=dtype) * 2 * math.pi)
+        self.scale = torch.nn.Parameter(torch.rand([self.groups], dtype=dtype) * eps)
+
+    def forward(self, X):
+        X0 = X[:, :self.groups]
+        X1 = X[:, self.groups:(self.groups * 2)]
+        X2 = X[:, (self.groups * 2):(self.groups * 3)]
+        Xr = X[:, (self.groups * 3):]
+        angle = X0 * self.scale + self.bias
+        c = torch.cos(angle)
+        s = torch.sin(angle)
+        return torch.cat([X0, c * X1 + s * X2, -s * X1 + c * X2, Xr], dim=1)
+
+    def penalty(self):
+        return self.l2_scale * torch.sum(self.scale ** 2)
+
 
 class ReversibleActivation(torch.nn.Module):
-    def __init__(self, inner, width, l2_weight):
+    def __init__(self, inner, width):
         super().__init__()
         self.inner = inner
         self.half_width = width // 2
-        self.l2_weight = l2_weight
+        # self.l2_weight = l2_weight
         eps = 0.01
-        self.weight = torch.nn.Parameter(eps * (torch.rand([width], dtype=dtype) * 2 - 1))
+        # self.weight = torch.nn.Parameter(eps * (torch.rand([width], dtype=dtype) * 2 - 1))
 
     def forward(self, X):
         assert X.shape[1] == self.half_width * 2
@@ -453,14 +517,14 @@ class ReversibleActivation(torch.nn.Module):
         return torch.cat([X0 + activations, X1], dim=1)
 
     def penalty(self):
-        return self.inner.penalty() + self.l2_weight * torch.sum(self.weight ** 2)
+        return self.inner.penalty() #+ self.l2_weight * torch.sum(self.weight ** 2)
 
 
 
 
 class ReversibleNetwork(torch.nn.Module):
     def __init__(self, num_inputs, num_outputs, width_pow, depth, butterfly_depth,
-                 l2_slope, l2_weight, l2_interact, dtype=torch.float):
+                 l2_slope, l2_scale, l2_bias, l2_interact, dtype=torch.float):
         super().__init__()
         self.dtype = dtype
         self.num_inputs = num_inputs
@@ -470,15 +534,25 @@ class ReversibleNetwork(torch.nn.Module):
         self.depth = depth
         self.butterfly_depth = butterfly_depth
         self.l2_slope = l2_slope
-        self.l2_weight = l2_weight
+        self.l2_scale = l2_scale
+        self.l2_bias = l2_bias
         self.l2_interact = l2_interact
         self.butterfly_layers = []
         self.activation_layers = []
         self.all_layers = []
+        # self.bias = torch.nn.Parameter(torch.tensor([0.0], dtype=dtype))
+        # self.scale = torch.nn.Parameter(torch.tensor([1.0], dtype=dtype))
         for i in range(depth):
             butterfly = OrthogonalButterfly(width_pow, butterfly_depth, l2_interact, dtype=dtype)
-            activation = ReversibleActivation(QuadraticSquashActivation(self.width // 2, l2_slope, None, 0.0, dtype=dtype),
-                                              self.width, l2_weight)
+            # activation = ReversibleActivation(QuadraticSquashActivation(self.width // 2, l2_slope, None, 0.0, dtype=dtype), self.width, l2_weight)
+            # inner_activation = QuinticSquashActivation(self.width // 2, l2_slope, l2_scale, 0.0, dtype=dtype)
+            inner_activation = QuadraticSquashActivation(self.width // 2, l2_slope, l2_scale, 0.0, dtype=dtype)
+            # inner_activation = CompactSmoothSquashActivation(self.width // 2, l2_slope, l2_scale, 0.0, dtype=dtype)
+            # activation = QuadraticSquashActivation(self.width, l2_slope, None, 0.0, dtype=dtype)
+            # inner_activation = KernelActivation(self.width // 2, l2_slope, 16, 2, dtype=dtype)
+            # inner_activation = QuadraticBumpActivation(self.width // 2, l2_slope, l2_scale, l2_bias, dtype)
+            activation = ReversibleActivation(inner_activation, self.width)
+            # activation = DynamicRotation(self.width, l2_scale)
             self.butterfly_layers.append(butterfly)
             self.all_layers.append(butterfly)
             if i != depth - 1:
@@ -502,9 +576,9 @@ class ReversibleNetwork(torch.nn.Module):
         return total
 
 
-N = 200
+N = 500
 # scale = 25
-scale = 5
+scale = 20
 seed = 2
 # dtype = torch.double
 dtype = torch.float
@@ -520,11 +594,11 @@ X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 #     num_inputs=1,
 #     num_outputs=1,
 #     width_pow=4,
-#     depth=3,
+#     depth=4,
 #     butterfly_depth=4,
-#     l2_slope=1e-5,#1e-7,#1e-6,#2e-2, #1e-3,#1e-8, #0.0000005, #0.0001,
+#     l2_slope=5e-5,#1e-5,#1e-7,#1e-6,#2e-2, #1e-3,#1e-8, #0.0000005, #0.0001,
 #     # l2_slope=0.000001, #0.0001,
-#     l2_scale=0,#1e-3,#2e-3, #1e-2, #1e-2, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
+#     l2_scale=5e-3,#1e-3,#2e-3, #1e-2, #1e-2, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
 #     l2_bias=0, #1e-6,
 #     l2_interact=0,#1e-5,#1e-4, #1e-5, #0.0001, #0.0001,
 #     dtype=dtype
@@ -533,11 +607,12 @@ X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 model = ReversibleNetwork(
     num_inputs=1,
     num_outputs=1,
-    width_pow=4,
-    depth=3,
-    butterfly_depth=4,
-    l2_slope=1e-5,
-    l2_weight=1.0,
+    width_pow=5,
+    depth=4,
+    butterfly_depth=5,
+    l2_slope=1e-5,#, 1e-3,#1e-4,
+    l2_scale=1e-5,#1e-3,#1e-3,
+    l2_bias=0,
     l2_interact=0,
     dtype=dtype)
 
@@ -548,13 +623,13 @@ model = ReversibleNetwork(
 # model = FullyConnectedNetwork(
 #     num_inputs=1,
 #     num_outputs=1,
-#     width_pow=4,
-#     depth=4,
-#     l2_slope=1e-4, #0.0000005, #0.0001,
+#     width_pow=5,
+#     depth=3,
+#     l2_slope=1e-7, #0.0000005, #0.0001,
 #     # l2_slope=0.000001, #0.0001,
-#     l2_scale=0, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
+#     l2_scale=1e-7, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
 #     l2_bias=0.0,
-#     l2_lin=1e-4, #1e-4, #1e-5, #0.0001, #0.0001,
+#     l2_lin=1e-7, #1e-4, #1e-5, #0.0001, #0.0001,
 #     dtype=dtype
 # )
 
@@ -613,7 +688,7 @@ for i in range(100000):
                 plt.scatter(X[:, 0], Y[:, 0], color='black', marker='.', alpha=0.3)
                 fig.canvas.draw()
 
-            print("seed={}, iteration={}: obj={:.7f}, train={:.7f}, true={:.7f}, obj grad norm={:.7f}, tr_radius={}, eig=({},{})".format(
+            print("seed={}, iteration={}: obj={:.7f}, train={:.7f}, true={:.7f}, obj grad norm={:.7g}, tr_radius={}, eig=({},{})".format(
                 seed, i, float(obj), float(loss), float(test_loss), gn, optimizer.state['tr_radius'], optimizer.state['min_eig'], optimizer.state['max_eig']))
             # if gn < 1e-7 or (last_loss == loss and last_gn == gn):
             #     print("Perturbing")
