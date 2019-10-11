@@ -25,13 +25,11 @@ def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=torch.float) - 0.5) * scale
     # Y = torch.cos(X)
     # Y = X * torch.sin(1 / X)
-    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
-    # Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X)))
+    # Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X)))
     # Y_true = torch.where(X > 0.2, torch.full_like(X, 1.0), torch.full_like(X, -1.0))
     Y = Y_true + noise * torch.randn([N, 1], dtype=torch.float)
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
-
-
 
 
 class OrthogonalButterfly(torch.nn.Module):
@@ -437,9 +435,76 @@ class FullyConnectedNetwork(torch.nn.Module):
         return total
 
 
+
+class ReversibleActivation(torch.nn.Module):
+    def __init__(self, inner, width, l2_weight):
+        super().__init__()
+        self.inner = inner
+        self.half_width = width // 2
+        self.l2_weight = l2_weight
+        eps = 0.01
+        self.weight = torch.nn.Parameter(eps * (torch.rand([width], dtype=dtype) * 2 - 1))
+
+    def forward(self, X):
+        assert X.shape[1] == self.half_width * 2
+        X0 = X[:, :self.half_width]
+        X1 = X[:, self.half_width:]
+        activations = self.inner(X1)
+        return torch.cat([X0 + activations, X1], dim=1)
+
+    def penalty(self):
+        return self.inner.penalty() + self.l2_weight * torch.sum(self.weight ** 2)
+
+
+
+
+class ReversibleNetwork(torch.nn.Module):
+    def __init__(self, num_inputs, num_outputs, width_pow, depth, butterfly_depth,
+                 l2_slope, l2_weight, l2_interact, dtype=torch.float):
+        super().__init__()
+        self.dtype = dtype
+        self.num_inputs = num_inputs
+        self.num_outputs = num_outputs
+        self.width_pow = width_pow
+        self.width = 2 ** width_pow
+        self.depth = depth
+        self.butterfly_depth = butterfly_depth
+        self.l2_slope = l2_slope
+        self.l2_weight = l2_weight
+        self.l2_interact = l2_interact
+        self.butterfly_layers = []
+        self.activation_layers = []
+        self.all_layers = []
+        for i in range(depth):
+            butterfly = OrthogonalButterfly(width_pow, butterfly_depth, l2_interact, dtype=dtype)
+            activation = ReversibleActivation(QuadraticSquashActivation(self.width // 2, l2_slope, None, 0.0, dtype=dtype),
+                                              self.width, l2_weight)
+            self.butterfly_layers.append(butterfly)
+            self.all_layers.append(butterfly)
+            if i != depth - 1:
+                self.activation_layers.append(activation)
+                self.all_layers.append(activation)
+        self.sequential = torch.nn.Sequential(*self.all_layers)
+
+    def forward(self, X):
+        assert X.dtype == self.dtype
+        assert X.shape[1] == self.num_inputs
+        X_in = torch.cat([X, torch.zeros([X.shape[0], self.width - self.num_inputs], dtype=self.dtype)], axis=1)
+        return self.sequential.forward(X_in)[:, :self.num_outputs] #* self.scale + self.bias
+
+    def penalty(self):
+        # total = self.l2_slope * (self.scale - 1) ** 2
+        total = 0.0
+        for layer in self.activation_layers:
+            total += layer.penalty()
+        for layer in self.butterfly_layers:
+            total += layer.penalty()
+        return total
+
+
 N = 200
 # scale = 25
-scale = 15
+scale = 5
 seed = 2
 # dtype = torch.double
 dtype = torch.float
@@ -451,19 +516,32 @@ X, Y_true, Y = gen_data(N, scale, noise=0.1, dtype=dtype)
 X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
 # Construct/initialize the model (0.023523079231381416)
-model = CustomNetwork(
+# model = CustomNetwork(
+#     num_inputs=1,
+#     num_outputs=1,
+#     width_pow=4,
+#     depth=3,
+#     butterfly_depth=4,
+#     l2_slope=1e-5,#1e-7,#1e-6,#2e-2, #1e-3,#1e-8, #0.0000005, #0.0001,
+#     # l2_slope=0.000001, #0.0001,
+#     l2_scale=0,#1e-3,#2e-3, #1e-2, #1e-2, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
+#     l2_bias=0, #1e-6,
+#     l2_interact=0,#1e-5,#1e-4, #1e-5, #0.0001, #0.0001,
+#     dtype=dtype
+# )
+
+model = ReversibleNetwork(
     num_inputs=1,
     num_outputs=1,
     width_pow=4,
-    depth=4,
+    depth=3,
     butterfly_depth=4,
-    l2_slope=1e-4,#1e-7,#1e-6,#2e-2, #1e-3,#1e-8, #0.0000005, #0.0001,
-    # l2_slope=0.000001, #0.0001,
-    l2_scale=0,#1e-3,#2e-3, #1e-2, #1e-2, #1e-5, #1e-4, #2e-4, #0.0000001, # 0.0000001,#0.00001,
-    l2_bias=0, #1e-6,
-    l2_interact=0,#1e-5,#1e-4, #1e-5, #0.0001, #0.0001,
-    dtype=dtype
-)
+    l2_slope=1e-5,
+    l2_weight=1.0,
+    l2_interact=0,
+    dtype=dtype)
+
+
 # model = KernelActivation(width=1, l2_slope=1e-2, dimension=32, range=2.0, dtype=dtype)
 
 # (0.03714136406779289)
