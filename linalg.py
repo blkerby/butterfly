@@ -21,7 +21,7 @@ def eps(dtype):
         raise RuntimeError("Unexpected dtype: {}".format(dtype))
 
 
-def expand_Q(Q, u, k, max_iter=10):
+def expand_Q(Q, u, k, max_iter=30):
     """Given a matrix `Q`, considered as only defined on its first k columns (the remaining columns being assumed to
     be unallocated memory), which are assumed to be orthonormal, modify Q by possibly adding a new column (in place,
     by replacing its (k+1)st column) with a new unit-length column orthogonal to the first `k` columns, determining a

@@ -118,8 +118,7 @@ class SR1Optimizer(torch.optim.Optimizer):
         Bs = Q.mv(M.mv(Qts)) + lam0 * ps
         u = Bs - y
         if len(eig) > 0:
-            self.state['max_eig'] = float(eig[-1])
-            self.state['min_eig'] = float(eig[0])
+            self.state['eig5'] = (eig[min(5, len(eig) - 1)], eig[max(len(eig)-5, 0)])
             max_eig = max(lam0, abs(float(eig[0])), float(eig[-1]))
         else:
             max_eig = lam0
@@ -128,8 +127,8 @@ class SR1Optimizer(torch.optim.Optimizer):
         s /= nm
         us = torch.dot(u, s)
 
-        update_limit = max_eig
-        c = torch.clamp(-1.0 / us, -update_limit, update_limit)
+        # update_limit = max_eig * 2
+        # c = torch.clamp(-1.0 / us, -update_limit, update_limit)
         # if abs(c) == update_limit:
         #     print("Clamping SR1 update: max_eig={}, c={}".format(max_eig, c))
 
@@ -143,8 +142,11 @@ class SR1Optimizer(torch.optim.Optimizer):
         #     us = torch.dot(u, s)
         #     # print("Increasing Hessian diagonal by {} (max_eig={}): us={}".format(lam1, max_eig, us))
 
-        # c = -1.0 / us
-        k = spectral_update(Q_buf, M_buf, lam0, u, c, k)
+        c = -1.0 / us
+        if torch.abs(us) < 1e-10 * torch.norm(s):
+            print("Skipping SR1 update")
+        else:
+            k = spectral_update(Q_buf, M_buf, lam0, u, c, k)
 
         # # Update the trust-radius
         # g0s = torch.dot(grad0, s)
