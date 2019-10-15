@@ -59,7 +59,7 @@ def expand_Q(Q, u, k, max_iter=30):
         r += r1
         nm1 = nm2
     else:
-        raise RuntimeError("expand_Q failed to converge")
+        raise RuntimeError("expand_Q failed to converge: Q0={}, u={}, k={}, nm1={}, r={}, nm0={}".format(Q0, u, k, nm1, r, nm0))
 
     u /= nm2
     Q[:, k] = u

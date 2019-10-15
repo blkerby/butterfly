@@ -2,6 +2,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 import torch
 from numpy.polynomial.legendre import leggauss
+from sympy import Poly
 
 class Spline:
     def __init__(self, family, coefs):
@@ -27,7 +28,7 @@ class Spline:
         p = self.family.degree
         t = self.family.padded_knots
         c = self.padded_coefs
-        k = np.clip(np.searchsorted(t, x) - 1, p, len(t) - p - 2)
+        k = np.clip(np.searchsorted(t.detach(), x.detach()) - 1, p + 1, len(t) - p - 3)
         x = torch.clamp(x, t[0], t[-1])
         d = [c[j + k - p] for j in range(0, p + 1)]
         for r in range(1, p + 1):
@@ -43,7 +44,9 @@ class Spline:
         t = self.family.knots
         c = self.coefs
         deriv_coef = p * (c[1:] - c[:-1]) / (t[p:] - t[:-p])
-        return Spline(family, torch.cat([torch.tensor([0.0]), deriv_coef, torch.tensor([0.0])]))
+        return Spline(family, torch.cat([torch.tensor([0.0], dtype=c.dtype),
+                                         deriv_coef,
+                                         torch.tensor([0.0], dtype=c.dtype)]))
 
     def inner_product(self, spline):
         """
@@ -98,37 +101,51 @@ class SplineFamily:
         self.dimension = len(self.knots) - degree + 1
         if self.dimension < 0:
             raise ValueError("degree too large for given number of knots")
-        self.padded_knots = torch.cat([torch.full([degree + 1], knots[0]), knots,
-                                       torch.full([degree + 1], knots[-1])])
+        self.padded_knots = torch.cat([torch.full([degree + 1], knots[0], dtype=knots.dtype), knots,
+                                       torch.full([degree + 1], knots[-1], dtype=knots.dtype)])
         leg_x, leg_wt = leggauss(max(1, degree))
         self.leg_x = torch.tensor(leg_x, dtype=knots.dtype, device=knots.device)
         self.leg_wt = torch.tensor(leg_wt, dtype=knots.dtype, device=knots.device)
 
+
     def bspline(self, coefs):
         return Spline(self, coefs)
 
-knots = torch.linspace(-1, 1, 6)
-degree = 1
-family = SplineFamily(knots, degree)
-coef = torch.zeros(family.dimension)
-coef[0] = 1.0
-coef[1] = 1.0
-coef[2] = 1.0
-coef.requires_grad = True
-# s = family.bspline(coef).derivative()
-# s = family.bspline(coef)
-# print(s.coefs)
-# print(s.inner_product(s))
-s = family.bspline(coef)
-# x = torch.linspace(-1.0, 1.0, 10000)
-# y = s.eval(x)
+if __name__ == '__main__':
+    knots = torch.linspace(-1, 1, 6)
+    degree = 4
+    family = SplineFamily(knots, degree)
+    coef = torch.zeros(family.dimension)
+    coef[0] = 1.0
+    coef[1] = 1.0
+    coef[2] = 1.0
+    coef.requires_grad = True
+    s = family.bspline(coef)
+    x = torch.linspace(-1.0, 1.0, 100)
+    y = s.eval(x)
+    pen = s.penalty([0.0, 0.0, 1.0])
+    print(pen)
+    pen.backward()
+    print(coef.grad)
 
-pen = s.penalty([0.0, 1.0])
-print(pen)
-
-# y[0].backward()
-#
-#
-# plt.plot(x, y)
-# plt.show()
-# torch.mean(y**2 * 2)
+    plt.plot(x.detach().numpy(), y.detach().numpy())
+    plt.show()
+    #
+    # # For each B-spline, compute polynomial coefficients on each interval in the monomial basis (centered at the
+    # # midpoint of the interval, for best numerical stability). This will allow us to evaluate splines using
+    # # Horner's method, which is much faster than De Boor's.
+    #
+    # # self.poly_coefs = torch.empty([len(self.family.knots) - 1, degree + 1, degree + 1])
+    # # poly_coefs = torch.empty([len(family.knots) - 1, degree + 1, degree + 1])
+    #
+    # centers = np.concatenate([[knots[0]], (knots[:-1] + knots[1:]) / 2, [knots[-1]]])
+    # from sympy.abc import x
+    # polys = [[Poly(1.0, x)] for i in range(len(family.knots) + 1)]
+    #
+    # for i in range(degree):
+    #     polys = [
+    #         [Poly(x - ()) polys[j][k] + polys[j][k + 1] for k in range(i)] +
+    #         for j in range(len(family.knots) - i)
+    #     ]
+    #     print(b)
+    #     # Poly()

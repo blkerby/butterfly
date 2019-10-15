@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import numpy as np
 import torch
 import torch.optim
 import torch.optim.lbfgs
@@ -8,6 +9,7 @@ import math
 import matplotlib.pyplot as plt
 from sr1_optimizer import SR1Optimizer
 from agd_optimizer import AGDOptimizer
+from spline import SplineFamily
 
 def compute_loss(pY, Y):
     err = pY - Y
@@ -165,33 +167,28 @@ class GaussianKernelActivation(KernelActivation):
 
 
 class SplineActivation(torch.nn.Module):
-    def __init__(self, width, l2_slope, l2_scale, dimension, range, order, dtype=torch.float):
+    def __init__(self, width, knots, degree, penalty_coefs, dtype=torch.float):
         super().__init__()
         self.dtype = dtype
-        self.l2_slope = l2_slope
-        self.l2_scale = l2_scale
-        self.dimension = dimension
-        self.range = range
-        self.centers = range * (torch.arange(dimension, dtype=dtype) / (dimension - 1) * 2 - 1)
-        eps = 0.5
-        self.weights = torch.nn.Parameter(torch.rand([width, dimension], dtype=dtype) * 2 * eps - eps)
-        self.scale = self.centers[1] - self.centers[0]
-        print(self.centers)
-
-    @abstractmethod
-    def base_activation(self, X):
-        pass
+        self.spline_family = SplineFamily(knots, degree)
+        self.penalty_coefs = penalty_coefs
+        eps = 0.1
+        self.coefs = torch.nn.Parameter(torch.rand([width, self.spline_family.dimension], dtype=dtype) * 2 * eps - eps)
 
     def forward(self, X):
-        assert X.dtype == self.dtype
-        total = torch.zeros_like(X)
-        for i in range(self.dimension):
-            total += self.base_activation((X - self.centers[i]) / self.scale) * self.weights[:, i]
-        return total
+        assert X.shape[1] == self.coefs.shape[0]
+        out = torch.empty_like(X)
+        for i in range(X.shape[1]):
+            spline = self.spline_family.bspline(self.coefs[i, :])
+            out[:, i] = spline.eval(X[:, i])
+        return out
 
     def penalty(self):
-        return self.l2_slope * (torch.sum(self.weights[:, 0] ** 2 + self.weights[:, -1] ** 2) + torch.sum((self.weights[:, 1:] - self.weights[:, :(self.dimension - 1)]) ** 2)) + \
-            self.l2_scale * torch.sum(self.weights ** 2)
+        total = 0.0
+        for i in range(self.coefs.shape[0]):
+            spline = self.spline_family.bspline(self.coefs[i, :])
+            total += spline.penalty(self.penalty_coefs)
+        return total
 
 
 class CubicSquashActivation(torch.nn.Module):
@@ -555,7 +552,7 @@ class ReversibleActivation(torch.nn.Module):
         self.inner = inner
         self.half_width = width // 2
         # self.l2_weight = l2_weight
-        eps = 0.01
+        # eps = 0.01
         # self.weight = torch.nn.Parameter(eps * (torch.rand([width], dtype=dtype) * 2 - 1))
 
     def forward(self, X):
@@ -563,6 +560,7 @@ class ReversibleActivation(torch.nn.Module):
         X0 = X[:, :self.half_width]
         X1 = X[:, self.half_width:]
         activations = self.inner(X1)
+        self.input = X1
         return torch.cat([X0 + activations, X1], dim=1)
 
     def penalty(self):
@@ -592,6 +590,23 @@ class ReversibleDoubleActivation(torch.nn.Module):
 
 
 
+class DoubleReLUQuadratic(torch.nn.Module):
+    def __init__(self, width, curvature, dtype=torch.float):
+        super().__init__()
+        self.width = width
+        self.bias = torch.nn.Parameter(torch.tensor([0.0], dtype=dtype))
+        self.a = curvature / 2
+        self.c = 1 / (4 * self.a)
+
+    def forward(self, X):
+        u1 = torch.clamp_min(X, -self.c)
+        y1 = torch.where(X > self.c, X, self.a * (X + self.c) ** 2)
+        u2 = torch.clamp_max(X, self.c)
+        y2 = torch.where(X < -self.c, X, self.a * (X - self.c) ** 2)
+        return torch.cat([y1, y2], dim=1)
+
+
+
 class ReversibleNetwork(torch.nn.Module):
     def __init__(self, num_inputs, num_outputs, width_pow, depth, butterfly_depth,
                  l2_slope, l2_scale, l2_bias, l2_interact, dtype=torch.float):
@@ -617,7 +632,14 @@ class ReversibleNetwork(torch.nn.Module):
             # activation = ReversibleActivation(QuadraticSquashActivation(self.width // 2, l2_slope, None, 0.0, dtype=dtype), self.width, l2_weight)
             # inner_activation = QuinticSquashActivation(self.width // 2, l2_slope, l2_scale, 0.0, dtype=dtype)
             # inner_activation = SigmoidActivation(self.width // 2, l2_slope, l2_scale, 0.0, dtype=dtype)
-            inner_activation_1 = QuadraticSquashActivation(self.width // 2, l2_slope, l2_scale, 0.0, dtype=dtype)
+            inner_activation_1 = SplineActivation(
+                self.width // 2,
+                knots=torch.tensor([-256.0, -128.0, -64.0, -32.0, -16.0, -8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0], dtype=dtype) / 32.0,
+                degree=2,
+                penalty_coefs=[0, 1e-3, 0],
+                dtype=dtype
+            )
+            # inner_activation_1 = QuadraticSquashActivation(self.width // 2, l2_slope, l2_scale, 0.0, dtype=dtype)
             # inner_activation_2 = QuadraticSquashActivation(self.width // 2, l2_slope, l2_scale, 0.0, dtype=dtype)
             # inner_activation_1 = GaussianKernelActivation(self.width // 2, l2_slope, l2_scale, 8, 8, dtype=dtype)
             # inner_activation_2 = KernelActivation(self.width // 2, l2_slope, l2_scale, 16, 4, dtype=dtype)
@@ -652,12 +674,12 @@ class ReversibleNetwork(torch.nn.Module):
         return total
 
 
-N = 500
+N = 200
 # scale = 25
 scale = 5
-seed = 2
-dtype = torch.double
-# dtype = torch.float
+seed = 0
+# dtype = torch.double
+dtype = torch.float
 
 torch.random.manual_seed(seed)
 
@@ -686,8 +708,8 @@ model = ReversibleNetwork(
     width_pow=5,
     depth=4,
     butterfly_depth=5,
-    l2_slope=1e-6,#1e-5,#e-5,#, 1e-3,#1e-4,
-    l2_scale=1e-6,#1e-5,#5e-4,#1e-3,#1e-3,
+    l2_slope=1e-6,#e-5,#, 1e-3,#1e-4,
+    l2_scale=1e-6,#5e-4,#1e-3,#1e-3,
     l2_bias=0,
     l2_interact=0,
     dtype=dtype)
@@ -726,10 +748,6 @@ last_gn = float("Inf")
 for i in range(100000):
     eval_cnt = 0
 
-    if i % 100 == 0:
-        for layer in model.activation_layers:
-            print("scale: {}".format(layer.inner.scale))
-
     def closure():
         global eval_cnt
         eval_cnt += 1
@@ -744,7 +762,7 @@ for i in range(100000):
     optimizer.step(closure)
     # optimizer.step(closure)
 
-    if i % 10 == 0:
+    if i % 5 == 0:
         model.zero_grad()
         pY = model(X)
         loss = compute_loss(pY, Y)
@@ -782,8 +800,13 @@ for i in range(100000):
             last_loss = loss
             last_gn = gn
 
+            inputs = []
+            for layer in model.activation_layers:
+                inputs.append(layer.input.detach())
+            all_inputs = torch.cat(inputs)
+            # print("Activation quantiles: {}".format(np.quantile(all_inputs, np.linspace(0, 1, 8))))
 
-plt.show()
+
 # model.weight.data = torch.round(model.weight)
 
 
