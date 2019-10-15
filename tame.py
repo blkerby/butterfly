@@ -14,6 +14,7 @@ class DoubleReLUQuadratic(torch.nn.Module):
 
     def forward(self, X):
         assert X.shape[1] >= self.width
+        X = X + self.bias
         X_unused = X[:, :(-self.width)]
         X_used = X[:, (-self.width):]
         u1 = torch.clamp_min(X_used, -self.c)
@@ -99,7 +100,7 @@ class OrthogonalButterfly(torch.nn.Module):
         return torch.cat([X_unused, X_used], dim=1)
 
     def penalty(self):
-        return torch.sum(self.l2_interact * torch.sin(2*self.params)**2)
+        return torch.sum(self.l2_interact * torch.sin(2*self.angles)**2)
 
 
 class ZeroPadding(torch.nn.Module):
@@ -110,6 +111,8 @@ class ZeroPadding(torch.nn.Module):
     def forward(self, X):
         return torch.cat([X, torch.zeros([X.shape[0], self.zero_padding], dtype=X.dtype, device=X.device)], dim=1)
 
+    def penalty(self):
+        return 0.0
 
 class TameNetwork(torch.nn.Module):
     def __init__(self,
@@ -137,6 +140,7 @@ class TameNetwork(torch.nn.Module):
         self.l2_interact = l2_interact
         self.l2_bias = l2_bias
         self.scales = torch.nn.Parameter(torch.full([input_width], 1.0))
+        # self.scales = torch.full([input_width], 80.0)
         self.layers = []
         self.dtype = dtype
         width = input_width
@@ -159,7 +163,7 @@ class TameNetwork(torch.nn.Module):
         return self.sequential.forward(X_in)[:, (-self.output_width):]
 
     def penalty(self):
-        return sum(layer.penalty() for layer in self.layers)
+        return sum(layer.penalty() for layer in self.layers) + self.l2_scale * torch.sum(self.scales ** 2)
 
 # x = torch.arange(1, dtype=torch.float32).view(1, -1)
 #
