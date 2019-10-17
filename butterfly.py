@@ -606,6 +606,22 @@ class DoubleReLUQuadratic(torch.nn.Module):
         return torch.cat([y1, y2], dim=1)
 
 
+class DoubleSigmoidQuadratic(torch.nn.Module):
+    def __init__(self, width, curvature, dtype=torch.float):
+        super().__init__()
+        self.width = width
+        self.bias = torch.nn.Parameter(torch.tensor([0.0], dtype=dtype))
+        self.a = curvature / 2
+        self.c = 1 / (4 * self.a)
+
+    def forward(self, X):
+        u1 = torch.clamp(X, -self.c)
+        y1 = torch.where(X > self.c, X, self.a * (X + self.c) ** 2)
+        u2 = torch.clamp_max(X, self.c)
+        y2 = torch.where(X < -self.c, X, self.a * (X - self.c) ** 2)
+        return torch.cat([y1, y2], dim=1)
+
+
 
 class ReversibleNetwork(torch.nn.Module):
     def __init__(self, num_inputs, num_outputs, width_pow, depth, butterfly_depth,

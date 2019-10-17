@@ -46,18 +46,20 @@ X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 model = TameNetwork(
     input_width=1,
     output_width=1,
-    working_width=2,
+    working_width=16,
     zero_padding=1,
-    exchange_depths=[2, 2, 2, 2, 2, 2, 2, 2, 5],
-    butterfly_depth=1,
-    l2_scale=1e-8,
+    exchange_depths=[5,5,5,5,5,5,5], #,3,1,2,1,5],#,0,1,0,2,0,1,0,4],
+    butterfly_depth=4,
+    l2_scale=1e-6,
     l2_load=0.0,
     l2_interact=0.0,
     l2_bias=0.0,
-    curvature=1.0,
-    dtype=torch.float32,
+    curvature=3.0,
+    l2_clamp=1e-4,
+    dtype=dtype,
     device=None
 )
+print("Number of parameters: {}".format(sum(len(x) for x in model.parameters())))
 
 
 # optimizer = AGDOptimizer(model.parameters())
@@ -65,7 +67,7 @@ optimizer = SR1Optimizer(model.parameters(), memory=2000)
 # optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=1, max_eval=10, history_size=1000, tolerance_grad=0, tolerance_change=0,
 #                               line_search_fn='strong_wolfe')
 # optimizer =torch.optim.SGD(model.parameters(), lr=0.02, nesterov=True, momentum=0.1)
-# optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
 
 fig = plt.gcf()
 fig.show()
