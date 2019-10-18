@@ -2,7 +2,49 @@ from abc import abstractmethod
 from typing import List
 import torch
 import math
+import torch.nn.functional
 
+
+class DoubleReLUGeneric(torch.nn.Module):
+    def __init__(self, width, l2_bias=0.0, curvature=5.0, dtype=torch.float, device=None):
+        super().__init__()
+        self.width = width
+        self.l2_bias = l2_bias
+        self.bias = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * 2 - 1)
+        self.curvature = curvature
+
+    @abstractmethod
+    def base_activation(self, X):
+        pass
+
+    def forward(self, X):
+        assert X.shape[1] >= self.width
+        X_unused = X[:, :(-self.width)]
+        X_used = X[:, (-self.width):] + self.bias
+        y1 = self.base_activation(X_used / self.curvature) * self.curvature
+        y2 = self.base_activation(-X_used / self.curvature) * self.curvature
+        return torch.cat([X_unused, y1, y2], dim=1)
+
+    def penalty(self):
+        return self.l2_bias * torch.sum(self.bias ** 2)
+
+
+class DoubleReLUSqrt(DoubleReLUGeneric):
+    def base_activation(self, X):
+        u = torch.clamp_min(X, -1.0)
+        c = math.sqrt(2.0) / 3 * (math.sqrt(8.0) - 1)
+        y = torch.where(u > 1, u - 1 + c, math.sqrt(2.0) / 3 * ((1 + u) ** 1.5 - 1))
+        return y
+
+class DoubleReLUSqrt2(DoubleReLUGeneric):
+    def base_activation(self, X):
+        v = torch.clamp_min(X, -1.0)
+        f1 = 1 / math.sqrt(2) * (v + v * v / 2)
+        c = 1 / math.sqrt(2) * (math.pi / 4 + 1 / 2)
+        u = 1 / math.sqrt(2) * (1 - v)
+        u0 = torch.clamp(u, 0.0, 1 / math.sqrt(2))  # Workaround Pytorch weird backprop behavior with NaNs in torch.where
+        f2 = c - 1 / math.sqrt(2) * (torch.asin(u0) + u0 * torch.sqrt(1 - u0 ** 2))
+        return torch.where(v > 1, v - 1 + c, torch.where(v > 0, f2, f1))
 
 
 class DoubleReLUQuadraticDynamicCurvature(torch.nn.Module):
@@ -28,6 +70,9 @@ class DoubleReLUQuadraticDynamicCurvature(torch.nn.Module):
 
     def penalty(self):
         return self.l2_bias * torch.sum(self.bias ** 2) + self.l2_curvature * torch.sum((self.curvature - 1) ** 2)
+
+
+
 
 
 class DoubleReLUQuadratic(torch.nn.Module):
@@ -166,6 +211,17 @@ class DoubleReLUFlexibleSmooth(DoubleReLUFlexible):
     def base_activation(self, X):
         return 0.5 * (X - 1 + torch.sqrt(X ** 2 + 1))
 
+
+class DoubleReLUFlexibleSoftPlus(DoubleReLUFlexible):
+    def base_activation(self, X):
+        return torch.nn.functional.softplus(X)
+
+class DoubleReLUFlexibleSqrt(DoubleReLUFlexible):
+    def base_activation(self, X):
+        u = torch.clamp_min(X, -1.0)
+        c = math.sqrt(2.0) / 3 * (math.sqrt(8.0) - 1)
+        y = torch.where(u > 1, u - 1 + c, math.sqrt(2.0) / 3 * ((1 + u) ** 1.5 - 1))
+        return y
 
 
 class DoubleSigmoid(torch.nn.Module):
@@ -400,8 +456,14 @@ class TameNetwork(torch.nn.Module):
             self.layers.append(OrthogonalButterfly(working_width, butterfly_depth, l2_interact=l2_interact, dtype=dtype, device=device))
             if i == len(exchange_depths) - 1:
                 break
-            self.layers.append(DoubleReLUQuadratic(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
-            # self.layers.append(DoubleReLUCubic(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
+            self.layers.append(DoubleReLU(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
+
+            # self.layers.append(DoubleReLUQuadratic(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
+            # self.layers.append(
+            #     DoubleReLUCubic(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
+
+            # self.layers.append(DoubleReLUSqrt2(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
+
             # self.layers.append(
             #     DoubleSigmoidLinear(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
             # self.layers.append(
@@ -413,10 +475,14 @@ class TameNetwork(torch.nn.Module):
             # self.layers.append(
             #     DoubleSigmoidCos(working_width, l2_bias=l2_bias, l2_clamp=l2_clamp, dtype=dtype, device=device))
 
+            # self.layers.append(DoubleReLUSqrt(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
+            # self.layers.append(
+            #     DoubleReLUFlexibleSqrt(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
             # self.layers.append(DoubleReLUSmooth(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
             # self.layers.append(DoubleReLUFlexibleLinear(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
             # self.layers.append(DoubleReLUFlexibleQuadratic(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
             # self.layers.append(DoubleReLUFlexibleSmooth(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
+            # self.layers.append(DoubleReLUFlexibleSoftPlus(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
             width += working_width
         self.sequential = torch.nn.Sequential(*self.layers)
         assert width >= output_width
@@ -428,6 +494,10 @@ class TameNetwork(torch.nn.Module):
         return self.sequential.forward(X_in)[:, (-self.output_width):]
 
     def penalty(self):
+        for layer in self.layers:
+            layer.l2_load = self.l2_load
+            layer.l2_interact = self.l2_interact
+            layer.l2_bias = self.l2_bias
         return sum(layer.penalty() for layer in self.layers) + self.l2_scale * torch.sum(self.scales ** 2)
 
 # x = torch.arange(1, dtype=torch.float32).view(1, -1)

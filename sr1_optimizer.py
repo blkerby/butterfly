@@ -77,6 +77,8 @@ class SR1Optimizer(torch.optim.Optimizer):
             x0 = self._gather_params()
             f0, grad0 = self._eval(x0, closure)
 
+        # print("f0: {}, grad norm: {}".format(f0, torch.norm(grad0)))
+
         # To determine where we should evaluate the function next, we use the trust-region method to find the minimum
         # of the current quadratic model of the function restricted to a ball of radius `tr_radius` centered at
         # the current point `x0`.
@@ -122,8 +124,8 @@ class SR1Optimizer(torch.optim.Optimizer):
             max_eig = max(lam0, abs(float(eig[0])), float(eig[-1]))
         else:
             max_eig = lam0
+
         nm = stable_norm(u)
-        # print("y={}, Bs={}, grad1={}, s={}".format(y, Bs, grad1, s))
         u /= nm
         s /= nm
         us = torch.dot(u, s)
@@ -147,7 +149,8 @@ class SR1Optimizer(torch.optim.Optimizer):
         # if nm == 0.0 or abs(c) > max_eig * 1e3:
         #     print("Skipping SR1 update")
         # else:
-        k = spectral_update(Q_buf, M_buf, lam0, u, c, k)
+        if nm != 0.0:
+            k = spectral_update(Q_buf, M_buf, lam0, u, c, k)
 
         # # Update the trust-radius
         # g0s = torch.dot(grad0, s)

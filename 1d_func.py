@@ -30,31 +30,40 @@ def gen_data(N, scale, noise, dtype=torch.float):
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
 
 
-N = 200
+N = 500
 # scale = 25
 scale = 5
-seed = 0
+seed = 1
 # dtype = torch.double
 dtype = torch.float
 
 torch.random.manual_seed(seed)
 
+
+def add_noise(X, num_noise_inputs, scale):
+    noise = (torch.rand([X.shape[0], num_noise_inputs], dtype=X.dtype, device=X.device) - 0.5) * scale
+    return torch.cat([X, noise], dim=1)
+
 # Generate the data
-X, Y_true, Y = gen_data(N, scale, noise=0.0, dtype=dtype)
+X, Y_true, Y = gen_data(N, scale, noise=0.1, dtype=dtype)
 X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
+num_noise_inputs = 1
+X = add_noise(X, num_noise_inputs, scale)
+X_test = add_noise(X_test, num_noise_inputs, scale)
+
 model = TameNetwork(
-    input_width=1,
+    input_width=1 + num_noise_inputs,
     output_width=1,
     working_width=16,
-    zero_padding=1,
-    exchange_depths=[5,5,5,5,5,5,5], #,3,1,2,1,5],#,0,1,0,2,0,1,0,4],
+    zero_padding=16,
+    exchange_depths=[5, 5, 5, 5, 5, 5, 5, 5, 5], #,3,1,2,1,5],#,0,1,0,2,0,1,0,4],
     butterfly_depth=4,
-    l2_scale=1e-6,
+    l2_scale=1e-7,
     l2_load=0.0,
     l2_interact=0.0,
     l2_bias=0.0,
-    curvature=3.0,
+    curvature=5.0,
     l2_clamp=1e-4,
     dtype=dtype,
     device=None
@@ -77,6 +86,9 @@ last_loss = float("Inf")
 last_gn = float("Inf")
 for i in range(100000):
     eval_cnt = 0
+    # model.l2_scale *= 0.999
+    # model.l2_load *= 1.001
+    # model.l2_interact *= 1.001
 
     def closure():
         global eval_cnt
@@ -111,13 +123,13 @@ for i in range(100000):
                 test_loss = compute_loss(pY_test, Y_test)
                 ind = torch.argsort(X_test[:, 0])
                 fig.clear()
-                plt.plot(X_test[ind, 0], Y_test[ind, 0], color='blue')
-                plt.plot(X_test[ind, 0], pY_test[ind, 0], color='black')
                 plt.scatter(X[:, 0], Y[:, 0], color='black', marker='.', alpha=0.3)
+                plt.plot(X_test[ind, 0], pY_test[ind, 0], color='red')
+                plt.plot(X_test[ind, 0], Y_test[ind, 0], color='blue')
                 fig.canvas.draw()
 
-            print("seed={}, iteration={}: obj={:.7f}, train={:.7f}, true={:.7f}, obj grad norm={:.7g}, tr_radius={}, eig5={}, scale={}".format(
-                seed, i, float(obj), float(loss), float(test_loss), gn, optimizer.state['tr_radius'], optimizer.state['eig5'], model.scales[0]))
+            print("seed={}, iteration={}: obj={:.7f}, train={:.7f}, true={:.7f}, obj grad norm={:.7g}, tr_radius={}, eig5={}, scale={}, wrong_scale={}".format(
+                seed, i, float(obj), float(loss), float(test_loss), gn, optimizer.state['tr_radius'], optimizer.state['eig5'], model.scales[0], torch.norm(model.scales[1:])))
             # if gn < 1e-7 or (last_loss == loss and last_gn == gn):
             #     print("Perturbing")
             #     for p in model.parameters():
