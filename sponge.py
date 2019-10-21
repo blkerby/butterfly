@@ -26,7 +26,7 @@ class Sponge(torch.nn.Module):
                  activation_size: int,
                  recall_size: int,
                  depth: int,
-                 activation_position: int,
+                 butterfly_depth: int,
                  l2_scale: Union[float, torch.Tensor],
                  l2_interact: float,
                  l2_bias: float,
@@ -36,23 +36,29 @@ class Sponge(torch.nn.Module):
         super().__init__()
         self.store_size = activation_size + recall_size
         assert recall_size <= sponge_size
-        assert activation_position + activation_size <= sponge_size
-        assert activation_position >= self.store_size
+        assert activation_size <= sponge_size
         self.input_size = input_size
         self.output_size = output_size
         self.sponge_size = sponge_size
         self.activation_size = activation_size
         self.recall_size = recall_size
         self.depth = depth
-        self.activation_position = activation_position
+        self.butterfly_depth = butterfly_depth
+        self.activation_position = self.store_size
         self.l2_scale = l2_scale
         self.l2_interact = l2_interact
         self.l2_bias = l2_bias
         self.activation_function = activation_function
         self.dtype = dtype
-        self.angles = torch.nn.Parameter(torch.rand([depth, sponge_size // 2], dtype=dtype, device=device) * 2 * math.pi)
+        self.angles = torch.nn.Parameter(torch.rand([depth, butterfly_depth, sponge_size // 2], dtype=dtype, device=device) * 2 * math.pi)
         self.bias = torch.nn.Parameter(torch.randn([depth, activation_size], dtype=dtype, device=device))
         self.scales = torch.nn.Parameter(torch.full([input_size], 1.0, dtype=dtype, device=device))
+
+        # Generate the permutation to use for the perfect shuffle (aka Faro shuffle)
+        self.shuffle_perm = torch.zeros([sponge_size], dtype=torch.long)
+        half_sponge_size = (sponge_size + 1) // 2
+        for i in range(sponge_size):
+            self.shuffle_perm[i] = (i // 2) + (i % 2) * half_sponge_size
 
         # Generate the sequence of recall locations
         self.start_size = max(0, input_size - sponge_size)
@@ -64,23 +70,14 @@ class Sponge(torch.nn.Module):
             self.recall_elements.append(elements)
             unused_set.difference_update(elements)
 
-        # Generate the sequence of output locations
-        # unused_size = len(unused_set)
-        self.output_elements = sorted(list(unused_set), reverse=True)[:output_size]
-        assert len(self.output_elements) == output_size
+        # Set up the butterfly for the output
+        bf_size = len(unused_set) + sponge_size
+        bf_depth = int(math.ceil(math.log2(bf_size)))
+        self.output_memory_list = sorted(unused_set)
+        print("bf_size:", bf_size, "output_memory_list", len(self.output_memory_list))
 
-        # Generate the permutation to use for the perfect shuffle (aka Faro shuffle)
-        self.shuffle_perm = torch.zeros([sponge_size], dtype=torch.long)
-        parity = (sponge_size + 1) % 2
-        for i in range(sponge_size):
-            j = 2 * i
-            if j >= sponge_size:
-                self.shuffle_perm[i] = j - sponge_size + parity
-            else:
-                self.shuffle_perm[i] = j
-
-        perm = torch.zeros_like(self.shuffle_perm)
-        perm[self.shuffle_perm] = torch.arange(len(perm))
+        self.output_butterfly = OrthogonalButterfly(bf_size, bf_depth, l2_interact=l2_interact, dtype=dtype,
+                                                    device=device)
 
     def fetch_memory(self, memory, j):
         """Fetch the j-th column from the memory list of tensors, as if `memory` were concatenated
@@ -114,25 +111,26 @@ class Sponge(torch.nn.Module):
 
         for i in range(self.depth):
             # print("sponge {}: {}".format(i, sponge))
+            for j in range(self.butterfly_depth):
+                # Faro shuffle
+                sponge = sponge[:, self.shuffle_perm]
 
-            # Perform orthogonal exchange
-            exch_size = self.sponge_size // 2
-            x1 = sponge[:, :exch_size]
-            x2 = sponge[:, exch_size:(2 * exch_size)]
-            cos_angles = torch.cos(self.angles[i, :])
-            sin_angles = torch.sin(self.angles[i, :])
-            y1 = cos_angles * x1 + sin_angles * x2
-            y2 = -sin_angles * x1 + cos_angles * x2
-            extra = sponge[:, (2 * exch_size):]  # At most one column which does not participate in the exchange (if sponge_size is odd)
-            sponge = torch.cat([y1, y2, extra], dim=1)
-
-            # Faro shuffle
-            sponge = sponge[:, self.shuffle_perm]
+                # Perform orthogonal exchange
+                exch_size = self.sponge_size // 2
+                x1 = sponge[:, :exch_size]
+                x2 = sponge[:, exch_size:(2 * exch_size)]
+                cos_angles = torch.cos(self.angles[i, j, :])
+                sin_angles = torch.sin(self.angles[i, j, :])
+                y1 = cos_angles * x1 + sin_angles * x2
+                y2 = -sin_angles * x1 + cos_angles * x2
+                extra = sponge[:, (2 * exch_size):]  # At most one column which does not participate in the exchange (if sponge_size is odd)
+                sponge = torch.cat([y1, y2, extra], dim=1)
 
             # Compute activations
             act_in = sponge[:, self.activation_position:(self.activation_position + self.activation_size)] + self.bias[i, :]
             act_plus = self.activation_function(act_in)
             act_minus = self.activation_function(-act_in)
+            act_out = torch.stack([act_plus, act_minus], dim=2).view(act_plus.shape[0], act_plus.shape[1] * 2)
 
             # Store off data which will leave the sponge
             memory.append(sponge[:, :self.store_size])
@@ -144,13 +142,14 @@ class Sponge(torch.nn.Module):
             sponge = torch.cat([
                 sponge[:, self.store_size:self.activation_position],
                 sponge[:, (self.activation_position + self.activation_size):],
-                act_plus,
-                act_minus,
+                act_out,
                 *recall,
             ], dim=1)
 
         # print("sponge final: {}".format(sponge))
-        return torch.stack([self.fetch_memory(memory, j) for j in self.output_elements], dim=1)
+        pre_output = torch.cat([self.fetch_memory(memory, j).view(-1, 1) for j in self.output_memory_list] + [sponge], dim=1)
+        output = self.output_butterfly(pre_output)
+        return output[:, :self.output_size]
 
     def penalty(self):
         return self.l2_bias * torch.sum(self.bias ** 2) + \
@@ -158,27 +157,28 @@ class Sponge(torch.nn.Module):
             self.l2_interact * torch.sum(torch.sin(self.angles * 2) ** 2)
 
 
-seed =0
-random.seed(seed)
-torch.random.manual_seed(seed)
-
-model = Sponge(
-    input_size=1,
-    output_size=1,
-    sponge_size=4,
-    activation_size=1,
-    recall_size=1,
-    depth=5,
-    l2_scale=1e-5,
-    l2_interact=1e-5,
-    l2_bias=1e-5,
-    activation_position=3,
-    activation_function=relu_activation, #sine_activation(2.0),
-    dtype=torch.float32,
-    device=None
-)
-
-X = torch.zeros([1, 1])
-y = model.forward(X)
-print(sum(len(p.view(-1)) for p in model.parameters()))
-
+# seed =0
+# random.seed(seed)
+# torch.random.manual_seed(seed)
+#
+# model = Sponge(
+#     input_size=1,
+#     output_size=1,
+#     sponge_size=4,
+#     activation_size=1,
+#     recall_size=1,
+#     depth=6,
+#     butterfly_depth=1,
+#     l2_scale=1e-5,
+#     l2_interact=1e-5,
+#     l2_bias=1e-5,
+#     activation_position=3,
+#     activation_function=relu_activation, #sine_activation(2.0),
+#     dtype=torch.float32,
+#     device=None
+# )
+#
+# X = torch.zeros([1, 1])
+# y = model.forward(X)
+# print(sum(len(p.view(-1)) for p in model.parameters()))
+#

@@ -33,8 +33,8 @@ def gen_data(N, scale, noise, dtype=torch.float):
 
 N = 500
 # scale = 25
-scale = 15
-seed = 5
+scale = 5
+seed = 14
 # dtype = torch.double
 dtype = torch.float
 
@@ -46,10 +46,10 @@ def add_noise(X, num_noise_inputs, scale):
     return torch.cat([X, noise], dim=1)
 
 # Generate the data
-X, Y_true, Y = gen_data(N, scale, noise=0.0, dtype=dtype)
+X, Y_true, Y = gen_data(N, scale, noise=0.1, dtype=dtype)
 X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
-num_noise_inputs = 0
+num_noise_inputs = 20
 X = add_noise(X, num_noise_inputs, scale)
 X_test = add_noise(X_test, num_noise_inputs, scale)
 
@@ -58,7 +58,7 @@ X_test = add_noise(X_test, num_noise_inputs, scale)
 #     output_width=1,
 #     working_width=4,
 #     zero_padding=0,
-#     exchange_depths=[5,1,2,1,3,1,2,1,4,1,2,1,3,1,2,1,5], #,3,1,2,1,5],#,0,1,0,2,0,1,0,4],
+#     exchange_depths=[6,1,2,1,3,1,2,1,4,1,2,1,3,1,2,1,5,1,2,1,3,1,2,1,4,1,2,1,3,1,2,1,6],
 #     butterfly_depth=2,
 #     l2_scale=1e-3,
 #     l2_load=0.0,
@@ -66,7 +66,7 @@ X_test = add_noise(X_test, num_noise_inputs, scale)
 #     l2_bias=1e-7,
 #     l2_activation=0.0,
 #     # l2_clamp=0.0,
-#     curvature=2.0,
+#     curvature=5.0,
 #     l2_curvature=1e-7,
 #     # l2_clamp=1e-4,
 #     dtype=dtype,
@@ -77,18 +77,19 @@ X_test = add_noise(X_test, num_noise_inputs, scale)
 model = Sponge(
     input_size=1 + num_noise_inputs,
     output_size=1,
-    sponge_size=8,
+    sponge_size=4,
     activation_size=1,
     recall_size=1,
-    depth=16,
-    l2_scale=1e-5,
-    l2_interact=1e-5,
-    l2_bias=1e-5,
-    activation_position=4,
-    activation_function=sine_activation(2.0), #relu_activation,
+    depth=35,
+    butterfly_depth=2,
+    l2_scale=5e-4,
+    l2_interact=5e-4,
+    l2_bias=1e-7,
+    activation_function=sine_activation(1.0), #relu_activation,
     dtype=dtype,
     device=None
 )
+
 print("Number of parameters: {}".format(sum(len(x.view(-1)) for x in model.parameters())))
 
 
@@ -152,9 +153,9 @@ for i in range(100000):
                 test_loss = compute_loss(pY_test, Y_test)
                 ind = torch.argsort(X_test[:, 0])
                 fig.clear()
-                plt.scatter(X[:, 0], Y[:, 0], color='black', marker='.', alpha=0.3)
-                plt.plot(X_test[ind, 0], pY_test[ind, 0], color='red', linewidth=2.0)
-                plt.plot(X_test[ind, 0], Y_test[ind, 0], color='blue')
+                plt.plot(X_test[ind, 0], pY_test[ind, 0], color='red', linewidth=2.0, zorder=1)
+                plt.scatter(X[:, 0], Y[:, 0], color='black', marker='.', alpha=0.3, zorder=2)
+                plt.plot(X_test[ind, 0], Y_test[ind, 0], color='blue', zorder=3)
                 fig.canvas.draw()
 
             print("seed={}, iteration={}: obj={:.7f}, train={:.7f}, true={:.7f}, obj grad norm={:.7g}, tr_radius={}, eig5={}, scale={:.4f}, wrong_scale={:.4f}".format(
