@@ -11,6 +11,7 @@ from sr1_optimizer import SR1Optimizer
 from agd_optimizer import AGDOptimizer
 from spline import SplineFamily
 from tame import TameNetwork
+from sponge import Sponge, sine_activation, relu_activation
 
 def compute_loss(pY, Y):
     err = pY - Y
@@ -23,8 +24,8 @@ def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=torch.float) - 0.5) * scale
     # Y = torch.cos(X)
     # Y_true = X * torch.sin(1 / X)
-    # Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
-    Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
+    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    # Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
     # Y_true = torch.where(X > 0.2, torch.full_like(X, 1.0), torch.full_like(X, -1.0))
     Y = Y_true + noise * torch.randn([N, 1], dtype=torch.float)
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
@@ -32,8 +33,8 @@ def gen_data(N, scale, noise, dtype=torch.float):
 
 N = 500
 # scale = 25
-scale = 5
-seed = 1
+scale = 15
+seed = 5
 # dtype = torch.double
 dtype = torch.float
 
@@ -45,30 +46,50 @@ def add_noise(X, num_noise_inputs, scale):
     return torch.cat([X, noise], dim=1)
 
 # Generate the data
-X, Y_true, Y = gen_data(N, scale, noise=0.1, dtype=dtype)
+X, Y_true, Y = gen_data(N, scale, noise=0.0, dtype=dtype)
 X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
-num_noise_inputs = 1
+num_noise_inputs = 0
 X = add_noise(X, num_noise_inputs, scale)
 X_test = add_noise(X_test, num_noise_inputs, scale)
 
-model = TameNetwork(
-    input_width=1 + num_noise_inputs,
-    output_width=1,
-    working_width=16,
-    zero_padding=16,
-    exchange_depths=[5, 5, 5, 5, 5, 5, 5, 5, 5], #,3,1,2,1,5],#,0,1,0,2,0,1,0,4],
-    butterfly_depth=4,
-    l2_scale=1e-7,
-    l2_load=0.0,
-    l2_interact=0.0,
-    l2_bias=0.0,
-    curvature=5.0,
-    l2_clamp=1e-4,
+# model = TameNetwork(
+#     input_width=1 + num_noise_inputs,
+#     output_width=1,
+#     working_width=4,
+#     zero_padding=0,
+#     exchange_depths=[5,1,2,1,3,1,2,1,4,1,2,1,3,1,2,1,5], #,3,1,2,1,5],#,0,1,0,2,0,1,0,4],
+#     butterfly_depth=2,
+#     l2_scale=1e-3,
+#     l2_load=0.0,
+#     l2_interact=0.0,
+#     l2_bias=1e-7,
+#     l2_activation=0.0,
+#     # l2_clamp=0.0,
+#     curvature=2.0,
+#     l2_curvature=1e-7,
+#     # l2_clamp=1e-4,
+#     dtype=dtype,
+#     device=None
+# )
+
+
+model = Sponge(
+    input_size=1 + num_noise_inputs,
+    output_size=1,
+    sponge_size=8,
+    activation_size=1,
+    recall_size=1,
+    depth=16,
+    l2_scale=1e-5,
+    l2_interact=1e-5,
+    l2_bias=1e-5,
+    activation_position=4,
+    activation_function=sine_activation(2.0), #relu_activation,
     dtype=dtype,
     device=None
 )
-print("Number of parameters: {}".format(sum(len(x) for x in model.parameters())))
+print("Number of parameters: {}".format(sum(len(x.view(-1)) for x in model.parameters())))
 
 
 # optimizer = AGDOptimizer(model.parameters())
@@ -77,6 +98,7 @@ optimizer = SR1Optimizer(model.parameters(), memory=2000)
 #                               line_search_fn='strong_wolfe')
 # optimizer =torch.optim.SGD(model.parameters(), lr=0.02, nesterov=True, momentum=0.1)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+batch_size = X.shape[0]
 
 fig = plt.gcf()
 fig.show()
@@ -95,8 +117,15 @@ for i in range(100000):
         eval_cnt += 1
         optimizer.zero_grad()
         model.zero_grad()
+
+        # ind = torch.randint(0, X.shape[0], (X.shape[0],))
+        # X_batch = X[ind, :]
+        # Y_batch = Y[ind]
+
         pY = model(X)
         loss = compute_loss(pY, Y)
+        # pY = model(X_batch)
+        # loss = compute_loss(pY, Y_batch)
         obj = compute_objective(model, loss)
         obj.backward()
         return obj
@@ -124,11 +153,11 @@ for i in range(100000):
                 ind = torch.argsort(X_test[:, 0])
                 fig.clear()
                 plt.scatter(X[:, 0], Y[:, 0], color='black', marker='.', alpha=0.3)
-                plt.plot(X_test[ind, 0], pY_test[ind, 0], color='red')
+                plt.plot(X_test[ind, 0], pY_test[ind, 0], color='red', linewidth=2.0)
                 plt.plot(X_test[ind, 0], Y_test[ind, 0], color='blue')
                 fig.canvas.draw()
 
-            print("seed={}, iteration={}: obj={:.7f}, train={:.7f}, true={:.7f}, obj grad norm={:.7g}, tr_radius={}, eig5={}, scale={}, wrong_scale={}".format(
+            print("seed={}, iteration={}: obj={:.7f}, train={:.7f}, true={:.7f}, obj grad norm={:.7g}, tr_radius={}, eig5={}, scale={:.4f}, wrong_scale={:.4f}".format(
                 seed, i, float(obj), float(loss), float(test_loss), gn, optimizer.state['tr_radius'], optimizer.state['eig5'], model.scales[0], torch.norm(model.scales[1:])))
             # if gn < 1e-7 or (last_loss == loss and last_gn == gn):
             #     print("Perturbing")

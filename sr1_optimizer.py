@@ -158,16 +158,17 @@ class SR1Optimizer(torch.optim.Optimizer):
         # tr_radius = tr_radius * torch.clamp(-g0s / (g1s - g0s) * tr_growth, 1 / tr_factor, tr_factor)
         actual_change = f1 - f0
         # print("actual change: {}, expected: {}".format(actual_change, expected_change))
-        if actual_change < expected_change * 0.99:
-            tr_radius = torch.norm(step) * tr_growth
-        elif actual_change > expected_change * 0.9:
-            tr_radius = torch.norm(step) / tr_growth
         if actual_change > f_tol * f0:
             # print("Rejecting step")
+            tr_radius /= tr_growth
             x1 = x0
             f1 = f0
             grad1 = grad0
             self._update_params(x0)
+        elif actual_change < expected_change * 0.99:
+            tr_radius = torch.norm(step) * tr_growth
+        elif actual_change > expected_change * 0.9:
+            tr_radius = torch.norm(step) / tr_growth
 
         self.state['x'] = x1
         self.state['f'] = f1

@@ -5,13 +5,85 @@ import math
 import torch.nn.functional
 
 
-class DoubleReLUGeneric(torch.nn.Module):
-    def __init__(self, width, l2_bias=0.0, curvature=5.0, dtype=torch.float, device=None):
+class DoubleReLULeaky(torch.nn.Module):
+    def __init__(self, width, l2_bias=0.0, l2_activation=0.0, curvature=5.0, dtype=torch.float, device=None):
         super().__init__()
         self.width = width
         self.l2_bias = l2_bias
-        self.bias = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * 2 - 1)
+        self.l2_activation = l2_activation
         self.curvature = curvature
+        self.bias = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.activation = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.angle = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * 2 * math.pi)
+
+    def base_activation(self, X):
+        pass
+
+    def forward(self, X):
+        assert X.shape[1] >= self.width
+        X_unused = X[:, :(-self.width)]
+        X_used = X[:, (-self.width):] + self.bias
+        a = self.activation
+        h = torch.sqrt(1 + a * a)
+        c = 1 / h
+        s = a / h
+        y_plus = self.base_activation(X_used * self.curvature) / self.curvature
+        y_minus = self.base_activation(-X_used * self.curvature) / self.curvature
+        y1 = y_plus - c * y_minus
+        y2 = s * y_minus
+        c1 = torch.cos(self.angle)
+        s1 = torch.sin(self.angle)
+        u1 = c1 * y1 + s1 * y2
+        u2 = -s1 * y1 + c1 * y2
+        return torch.cat([X_unused, u1, u2], dim=1)
+
+    def penalty(self):
+        return self.l2_bias * torch.sum(self.bias ** 2) + self.l2_activation * torch.sum(self.activation ** 2)
+
+
+class DoubleReLULeakyLinear(DoubleReLULeaky):
+    def base_activation(self, X):
+        return torch.clamp_min(X, 0.0)
+
+
+class DoubleReLULeakyQuadratic(DoubleReLULeaky):
+    def base_activation(self, X):
+        u = torch.clamp_min(X, -1)
+        return torch.where(u > 1, u, 0.25 * (u + 1) ** 2)
+
+
+class DoubleReLULeakySine(DoubleReLULeaky):
+    def base_activation(self, X):
+        u = torch.clamp_min(X, -math.pi / 4)
+        return torch.where(u > math.pi / 4, u - math.pi / 4 + 1 / math.sqrt(2),
+                           1 / math.sqrt(2) - torch.cos(u + math.pi / 4))
+
+
+class DoubleReLULeakyQuadraticDynamic(DoubleReLULeaky):
+    def __init__(self, width, l2_bias=0.0, l2_activation=0.0, l2_clamp=0.0, curvature=5.0, dtype=torch.float, device=None):
+        super().__init__(width, l2_bias, l2_activation, curvature=curvature, dtype=dtype, device=device)
+        self.l2_clamp = l2_clamp
+        self.clamp = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        # self.clamp = torch.full([width], 0.75, dtype=dtype, device=device)
+
+    def base_activation(self, X):
+        c = self.clamp + torch.sqrt(self.clamp ** 2 + 0.1)
+        u = torch.max(X, -c)
+        return torch.where(u > c, u, 0.25 / c * (u + c) ** 2)
+
+    def penalty(self):
+        return super().penalty() + self.l2_clamp * torch.sum(self.clamp ** 2)
+
+class DoubleReLUGeneric(torch.nn.Module):
+    def __init__(self, width, l2_bias=0.0, l2_curvature=0.0, curvature=5.0, dtype=torch.float, device=None):
+        super().__init__()
+        self.width = width
+        self.l2_bias = l2_bias
+        # self.l2_curvature = l2_curvature
+        self.curvature = curvature
+        self.bias = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device) * 0.1)
+        # self.curvature = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * curvature)
+        self.angle = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * 2 * math.pi)
 
     @abstractmethod
     def base_activation(self, X):
@@ -21,12 +93,17 @@ class DoubleReLUGeneric(torch.nn.Module):
         assert X.shape[1] >= self.width
         X_unused = X[:, :(-self.width)]
         X_used = X[:, (-self.width):] + self.bias
-        y1 = self.base_activation(X_used / self.curvature) * self.curvature
-        y2 = self.base_activation(-X_used / self.curvature) * self.curvature
-        return torch.cat([X_unused, y1, y2], dim=1)
+        k = self.curvature ** 2
+        y1 = self.base_activation(X_used * k) / k
+        y2 = self.base_activation(-X_used * k) / k
+        c = torch.cos(self.angle)
+        s = torch.sin(self.angle)
+        u1 = c * y1 + s * y2
+        u2 = -s * y1 + c * y2
+        return torch.cat([X_unused, u1, u2], dim=1)
 
     def penalty(self):
-        return self.l2_bias * torch.sum(self.bias ** 2)
+        return self.l2_bias * torch.sum(self.bias ** 2) #+ self.l2_curvature * torch.sum(self.curvature ** 2)
 
 
 class DoubleReLUSqrt(DoubleReLUGeneric):
@@ -45,6 +122,18 @@ class DoubleReLUSqrt2(DoubleReLUGeneric):
         u0 = torch.clamp(u, 0.0, 1 / math.sqrt(2))  # Workaround Pytorch weird backprop behavior with NaNs in torch.where
         f2 = c - 1 / math.sqrt(2) * (torch.asin(u0) + u0 * torch.sqrt(1 - u0 ** 2))
         return torch.where(v > 1, v - 1 + c, torch.where(v > 0, f2, f1))
+
+
+class DoubleReLUSine(DoubleReLUGeneric):
+    def base_activation(self, X):
+        u = torch.clamp_min(X, -math.pi / 4)
+        return torch.where(u > math.pi / 4, u - math.pi / 4 + 1 / math.sqrt(2),
+                           1 / math.sqrt(2) - torch.cos(u + math.pi / 4))
+
+
+class DoubleReLULinear(DoubleReLUGeneric):
+    def base_activation(self, X):
+        return torch.clamp_min(X, 0.0)
 
 
 class DoubleReLUQuadraticDynamicCurvature(torch.nn.Module):
@@ -170,15 +259,16 @@ class DoubleReLU(torch.nn.Module):
 
 
 class DoubleReLUFlexible(torch.nn.Module):
-    def __init__(self, width, l2_bias=0.0, curvature=5.0, dtype=torch.float, device=None):
+    def __init__(self, width, l2_bias=0.0, l2_curvature=0.0, curvature=5.0, dtype=torch.float, device=None):
         super().__init__()
         self.width = width
         self.l2_bias = l2_bias
+        self.l2_curvature = l2_curvature
         self.bias = torch.nn.Parameter(torch.full([width], 0.0, dtype=dtype, device=device))
         self.angles_plus = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * math.pi * 2)
         self.angles_minus = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * math.pi * 2)
-        # self.curvature = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * 0.1 + 0.95)
-        self.curvature = curvature
+        self.curvature = torch.nn.Parameter(torch.rand([width], dtype=dtype, device=device) * curvature)
+        # self.curvature = curvature
 
     @abstractmethod
     def base_activation(self, X):
@@ -195,7 +285,7 @@ class DoubleReLUFlexible(torch.nn.Module):
         return torch.cat([X_unused, y1, y2], dim=1)
 
     def penalty(self):
-        return self.l2_bias * torch.sum(self.bias ** 2) #+ self.l2_curvature * torch.sum((1 / self.curvature) ** 2)
+        return self.l2_bias * torch.sum(self.bias ** 2) + self.l2_curvature * torch.sum(self.curvature ** 2)
 
 class DoubleReLUFlexibleLinear(DoubleReLUFlexible):
     def base_activation(self, X):
@@ -206,6 +296,14 @@ class DoubleReLUFlexibleQuadratic(DoubleReLUFlexible):
     def base_activation(self, X):
         u = torch.clamp_min(X, -1)
         return torch.where(u > 1, u, 0.25 * (u + 1) ** 2)
+
+
+class DoubleReLUFlexibleSine(DoubleReLUFlexible):
+    def base_activation(self, X):
+        u = torch.clamp_min(X, -math.pi / 4)
+        return torch.where(u > math.pi / 4, u - math.pi / 4 + 1 / math.sqrt(2),
+                           1 / math.sqrt(2) - torch.cos(u + math.pi / 4))
+
 
 class DoubleReLUFlexibleSmooth(DoubleReLUFlexible):
     def base_activation(self, X):
@@ -365,7 +463,7 @@ class OrthogonalExchange(torch.nn.Module):
         return X
 
     def penalty(self):
-        return self.l2_load * sum(torch.sum(torch.sin(angles)**2) for angles in self.angles)
+        return self.l2_load * sum(torch.sum(torch.sin(angles*2)**2) for angles in self.angles)
 
 
 class OrthogonalButterfly(torch.nn.Module):
@@ -429,7 +527,10 @@ class TameNetwork(torch.nn.Module):
                  l2_load=0.0,
                  l2_interact=0.0,
                  l2_bias=0.0,
+                 l2_activation=0.0,
+                 l2_curvature=0.0,
                  l2_clamp=0.0,
+                 # l2_clamp=0.0,
                  curvature=5.0,
                  dtype=torch.float32,
                  device=None):
@@ -456,9 +557,33 @@ class TameNetwork(torch.nn.Module):
             self.layers.append(OrthogonalButterfly(working_width, butterfly_depth, l2_interact=l2_interact, dtype=dtype, device=device))
             if i == len(exchange_depths) - 1:
                 break
-            self.layers.append(DoubleReLU(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
+            self.layers.append(
+                DoubleReLUSine(working_width, l2_bias=l2_bias, l2_curvature=l2_curvature, curvature=curvature,
+                                       dtype=dtype, device=device))
+
+            # self.layers.append(
+            #     DoubleReLUFlexibleSine(working_width, l2_bias=l2_bias, l2_curvature=l2_curvature, curvature=curvature,
+            #                            dtype=dtype, device=device))
+
+            # self.layers.append(
+            #     DoubleReLULeakySine(working_width, l2_bias=l2_bias, curvature=curvature,
+            #                            dtype=dtype, device=device))
+
+            # self.layers.append(
+            #     DoubleReLULinear(working_width, l2_bias=l2_bias, l2_curvature=l2_curvature, curvature=curvature,
+            #                            dtype=dtype, device=device))
 
             # self.layers.append(DoubleReLUQuadratic(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
+
+            # self.layers.append(DoubleReLUFlexibleLinear(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
+            # self.layers.append(DoubleReLUFlexibleQuadratic(working_width, l2_bias=l2_bias, l2_curvature=l2_curvature, curvature=curvature, dtype=dtype, device=device))
+            # self.layers.append(DoubleReLU(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
+            # self.layers.append(DoubleReLULeakyLinear(working_width, l2_bias=l2_bias, l2_activation=l2_activation, dtype=dtype, device=device))
+
+            # self.layers.append(DoubleReLULeakyQuadratic(working_width, l2_bias=l2_bias, l2_activation=l2_activation, curvature=curvature, dtype=dtype, device=device))
+            # self.layers.append(DoubleReLULeakyQuadraticDynamic(working_width, l2_bias=l2_bias, l2_activation=l2_activation, l2_clamp=l2_clamp, curvature=curvature, dtype=dtype, device=device))
+
+
             # self.layers.append(
             #     DoubleReLUCubic(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
 
@@ -479,8 +604,6 @@ class TameNetwork(torch.nn.Module):
             # self.layers.append(
             #     DoubleReLUFlexibleSqrt(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
             # self.layers.append(DoubleReLUSmooth(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
-            # self.layers.append(DoubleReLUFlexibleLinear(working_width, l2_bias=l2_bias, dtype=dtype, device=device))
-            # self.layers.append(DoubleReLUFlexibleQuadratic(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
             # self.layers.append(DoubleReLUFlexibleSmooth(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
             # self.layers.append(DoubleReLUFlexibleSoftPlus(working_width, l2_bias=l2_bias, curvature=curvature, dtype=dtype, device=device))
             width += working_width
@@ -548,3 +671,6 @@ class TameNetwork(torch.nn.Module):
 # # y = activation.forward(x)
 # # print(y)
 # # y = exchange.forward(x)
+
+# DoubleReLU:
+# DoubleReLULeakyLinear: seed=1, iteration=1105: obj=0.0152846, train=0.0101460, true=0.0014011, obj grad norm=0.00571639, tr_radius=0.018104754388332367, eig5=(tensor(-92.6752), tensor(95.6837)), scale=4.6068, wrong_scale=0.0000
