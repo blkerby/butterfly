@@ -24,17 +24,17 @@ def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=torch.float) - 0.5) * scale
     # Y = torch.cos(X)
     # Y_true = X * torch.sin(1 / X)
-    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
-    # Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
+    # Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
     # Y_true = torch.where(X > 0.2, torch.full_like(X, 1.0), torch.full_like(X, -1.0))
     Y = Y_true + noise * torch.randn([N, 1], dtype=torch.float)
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
 
 
-N = 500
+N = 100
 # scale = 25
 scale = 5
-seed = 14
+seed = 15
 # dtype = torch.double
 dtype = torch.float
 
@@ -46,10 +46,10 @@ def add_noise(X, num_noise_inputs, scale):
     return torch.cat([X, noise], dim=1)
 
 # Generate the data
-X, Y_true, Y = gen_data(N, scale, noise=0.1, dtype=dtype)
+X, Y_true, Y = gen_data(N, scale, noise=0.0, dtype=dtype)
 X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
-num_noise_inputs = 20
+num_noise_inputs = 0
 X = add_noise(X, num_noise_inputs, scale)
 X_test = add_noise(X_test, num_noise_inputs, scale)
 
@@ -80,12 +80,15 @@ model = Sponge(
     sponge_size=4,
     activation_size=1,
     recall_size=1,
-    depth=35,
+    depth=24,
     butterfly_depth=2,
-    l2_scale=5e-4,
-    l2_interact=5e-4,
+    neutral_curvature=2.0,
+    l2_scale=1e-5,
+    l2_interact=0.0,#1e-4,
+    l2_curvature=1e-8,
+    l2_activation=1e-5,
     l2_bias=1e-7,
-    activation_function=sine_activation(1.0), #relu_activation,
+    # activation_function=sine_activation(5.0), #relu_activation,
     dtype=dtype,
     device=None
 )
@@ -109,9 +112,8 @@ last_loss = float("Inf")
 last_gn = float("Inf")
 for i in range(100000):
     eval_cnt = 0
+    # model.l2_interact *= 0.999
     # model.l2_scale *= 0.999
-    # model.l2_load *= 1.001
-    # model.l2_interact *= 1.001
 
     def closure():
         global eval_cnt
@@ -135,6 +137,12 @@ for i in range(100000):
     # optimizer.step(closure)
 
     if i % 5 == 0:
+        # for a in model.activations:
+        #     print(a.curvature)
+        # print(model.bias)
+        # for j, s in enumerate(model.sponge_steps):
+        #     print("Layer {}: {}".format(j, torch.mean(torch.sum(s ** 2, dim=1))))
+
         model.zero_grad()
         pY = model(X)
         loss = compute_loss(pY, Y)

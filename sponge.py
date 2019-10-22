@@ -18,6 +18,55 @@ def relu_activation(X):
     return torch.clamp_min(X, 0.0)
 
 
+
+class FlexibleActivation(torch.nn.Module):
+    def __init__(self, width, neutral_curvature,
+                 l2_activation, l2_curvature, l2_bias,
+                 dtype=torch.float32, device=None):
+        super().__init__()
+        self.width = width
+        self.neutral_curvature = neutral_curvature
+        self.l2_activation = l2_activation
+        self.l2_curvature = l2_curvature
+        self.l2_bias = l2_bias
+        self.bias = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.activation = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.curvature = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+
+    def base_activation(self, X):
+        # Transform `activation` onto a scale between 0 and 1
+        a = 0.5 * (1 + self.activation / torch.sqrt(self.activation ** 2 + 1))
+
+        # Transform `curvature` onto a scale between 0 and infinity
+        c = 0.5 * self.neutral_curvature * (self.curvature + torch.sqrt(self.curvature ** 2 + 1))
+        # c = 10.0
+        a = torch.tensor(1.0)
+
+        # Compute the positive threshold beyond which the activation becomes linear
+        t = math.pi / 4 / c * a
+
+        # Compute the value and slope of the line beyond the positive threshold
+        y0 = 1 / c * (1 / math.sqrt(2) - torch.cos(math.pi / 4 * (1 + a)))
+        m0 = torch.sin(math.pi / 4 * (1 + a))
+
+        # Compute the value and slope of the line beyond the negative threshold
+        y1 = 1 / c * (1 / math.sqrt(2) - torch.cos(math.pi / 4 * (1 - a)))
+        m1 = torch.sin(math.pi / 4 * (1 - a))
+
+        return torch.where(X > t, y0 + m0 * (X - t),
+                           torch.where(X < -t, y1 + m1 * (X + t),
+                                       1 / c * (1 / math.sqrt(2) - torch.cos(math.pi / 4 + c * X))))
+
+    def forward(self, X):
+        X1 = X + self.bias
+        return self.base_activation(X1), self.base_activation(-X1)
+
+    def penalty(self):
+        return self.l2_bias * torch.sum(self.bias ** 2) + \
+                self.l2_activation * torch.sum(self.activation ** 2) + \
+                self.l2_curvature * torch.sum(self.curvature ** 2)
+
+
 class Sponge(torch.nn.Module):
     def __init__(self,
                  input_size: int,
@@ -27,10 +76,12 @@ class Sponge(torch.nn.Module):
                  recall_size: int,
                  depth: int,
                  butterfly_depth: int,
+                 neutral_curvature: float,
                  l2_scale: Union[float, torch.Tensor],
                  l2_interact: float,
+                 l2_curvature: float,
+                 l2_activation: float,
                  l2_bias: float,
-                 activation_function,
                  dtype=torch.float32,
                  device=None):
         super().__init__()
@@ -48,11 +99,22 @@ class Sponge(torch.nn.Module):
         self.l2_scale = l2_scale
         self.l2_interact = l2_interact
         self.l2_bias = l2_bias
-        self.activation_function = activation_function
         self.dtype = dtype
         self.angles = torch.nn.Parameter(torch.rand([depth, butterfly_depth, sponge_size // 2], dtype=dtype, device=device) * 2 * math.pi)
-        self.bias = torch.nn.Parameter(torch.randn([depth, activation_size], dtype=dtype, device=device))
         self.scales = torch.nn.Parameter(torch.full([input_size], 1.0, dtype=dtype, device=device))
+        # self.activation_function = sine_activation(5.0)
+        self.activations = torch.nn.ModuleList([FlexibleActivation(
+            width=activation_size,
+            neutral_curvature=neutral_curvature,
+            l2_activation=l2_activation,
+            l2_curvature=l2_curvature,
+            l2_bias=l2_bias,
+            dtype=dtype,
+            device=device,
+        ) for _ in range(depth)])
+
+        # self.bias = torch.nn.Parameter(torch.randn([depth, activation_size], dtype=dtype, device=device))
+        #self.output_bias = torch.nn.Parameter(torch.randn([output_size], dtype=dtype, device=device))
 
         # Generate the permutation to use for the perfect shuffle (aka Faro shuffle)
         self.shuffle_perm = torch.zeros([sponge_size], dtype=torch.long)
@@ -109,6 +171,8 @@ class Sponge(torch.nn.Module):
         # which did not fit in the sponge.
         memory = [X[:, self.sponge_size:]]
 
+        # Keep track of sponge state at end of each stage, for diagnostics
+        self.sponge_steps = []
         for i in range(self.depth):
             # print("sponge {}: {}".format(i, sponge))
             for j in range(self.butterfly_depth):
@@ -127,10 +191,13 @@ class Sponge(torch.nn.Module):
                 sponge = torch.cat([y1, y2, extra], dim=1)
 
             # Compute activations
-            act_in = sponge[:, self.activation_position:(self.activation_position + self.activation_size)] + self.bias[i, :]
-            act_plus = self.activation_function(act_in)
-            act_minus = self.activation_function(-act_in)
+            act_in = sponge[:, self.activation_position:(self.activation_position + self.activation_size)]
+            act_plus, act_minus = self.activations[i](act_in)
+            # act_in = sponge[:, self.activation_position:(self.activation_position + self.activation_size)] + self.bias[i, :]
+            # act_plus = self.activation_function(act_in) #- self.activation_function(self.bias[i, :])
+            # act_minus = -self.activation_function(-act_in) #+ self.activation_function(-self.bias[i, :])
             act_out = torch.stack([act_plus, act_minus], dim=2).view(act_plus.shape[0], act_plus.shape[1] * 2)
+            self.sponge_steps.append(sponge)
 
             # Store off data which will leave the sponge
             memory.append(sponge[:, :self.store_size])
@@ -140,21 +207,23 @@ class Sponge(torch.nn.Module):
 
             # Create the next iteration of the sponge
             sponge = torch.cat([
+                act_out,
                 sponge[:, self.store_size:self.activation_position],
                 sponge[:, (self.activation_position + self.activation_size):],
-                act_out,
                 *recall,
             ], dim=1)
 
         # print("sponge final: {}".format(sponge))
         pre_output = torch.cat([self.fetch_memory(memory, j).view(-1, 1) for j in self.output_memory_list] + [sponge], dim=1)
         output = self.output_butterfly(pre_output)
-        return output[:, :self.output_size]
+        return output[:, :self.output_size] #+ self.output_bias
 
     def penalty(self):
-        return self.l2_bias * torch.sum(self.bias ** 2) + \
-            self.l2_scale * torch.sum(self.scales ** 2) + \
-            self.l2_interact * torch.sum(torch.sin(self.angles * 2) ** 2)
+        return self.l2_scale * torch.sum(self.scales ** 2) + \
+            self.l2_interact * torch.sum(torch.sin(self.angles * 2) ** 2) + \
+            sum(a.penalty() for a in self.activations)
+            # self.l2_bias * torch.sum(self.bias ** 2)
+# self.activation.penalty() + \
 
 
 # seed =0
