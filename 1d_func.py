@@ -1,5 +1,3 @@
-from abc import abstractmethod
-import numpy as np
 import torch
 import torch.optim
 import torch.optim.lbfgs
@@ -8,10 +6,8 @@ import torch.nn
 import math
 import matplotlib.pyplot as plt
 from sr1_optimizer import SR1Optimizer
-from agd_optimizer import AGDOptimizer
-from spline import SplineFamily
 from tame import TameNetwork
-from sponge import Sponge, sine_activation, relu_activation
+from sponge import Sponge
 
 def compute_loss(pY, Y):
     err = pY - Y
@@ -86,7 +82,6 @@ model = Sponge(
     l2_scale=1e-5,
     l2_interact=0.0,#1e-4,
     l2_curvature=1e-8,
-    l2_activation=1e-5,
     l2_bias=1e-7,
     # activation_function=sine_activation(5.0), #relu_activation,
     dtype=dtype,
@@ -101,7 +96,7 @@ optimizer = SR1Optimizer(model.parameters(), memory=2000)
 # optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=1, max_eval=10, history_size=1000, tolerance_grad=0, tolerance_change=0,
 #                               line_search_fn='strong_wolfe')
 # optimizer =torch.optim.SGD(model.parameters(), lr=0.02, nesterov=True, momentum=0.1)
-# optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
 batch_size = X.shape[0]
 
 fig = plt.gcf()
