@@ -20,17 +20,17 @@ def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=torch.float) - 0.5) * scale
     # Y = torch.cos(X)
     # Y_true = X * torch.sin(1 / X)
-    # Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
-    Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
+    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    # Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
     # Y_true = torch.where(X > 0.2, torch.full_like(X, 1.0), torch.full_like(X, -1.0))
     Y = Y_true + noise * torch.randn([N, 1], dtype=torch.float)
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
 
 
-N = 100
+N = 200
 # scale = 25
 scale = 5
-seed = 15
+seed = 18
 # dtype = torch.double
 dtype = torch.float
 
@@ -45,7 +45,7 @@ def add_noise(X, num_noise_inputs, scale):
 X, Y_true, Y = gen_data(N, scale, noise=0.0, dtype=dtype)
 X_test, _, Y_test = gen_data(5000, scale, 0, dtype)
 
-num_noise_inputs = 0
+num_noise_inputs = 20
 X = add_noise(X, num_noise_inputs, scale)
 X_test = add_noise(X_test, num_noise_inputs, scale)
 
@@ -75,14 +75,14 @@ model = Sponge(
     output_size=1,
     sponge_size=4,
     activation_size=1,
-    recall_size=1,
-    depth=24,
+    recall_size=0,
+    depth=8,
     butterfly_depth=2,
-    neutral_curvature=2.0,
-    l2_scale=1e-5,
+    neutral_curvature=1.0,
+    l2_scale=0.0,
     l2_interact=0.0,#1e-4,
-    l2_curvature=1e-8,
-    l2_bias=1e-7,
+    l2_curvature=1e-7,
+    l2_bias=0.0,
     # activation_function=sine_activation(5.0), #relu_activation,
     dtype=dtype,
     device=None
@@ -96,7 +96,7 @@ optimizer = SR1Optimizer(model.parameters(), memory=2000)
 # optimizer = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=1, max_eval=10, history_size=1000, tolerance_grad=0, tolerance_change=0,
 #                               line_search_fn='strong_wolfe')
 # optimizer =torch.optim.SGD(model.parameters(), lr=0.02, nesterov=True, momentum=0.1)
-# optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
 batch_size = X.shape[0]
 
 fig = plt.gcf()

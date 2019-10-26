@@ -4,6 +4,25 @@ import math
 import random
 from tame import OrthogonalButterfly
 
+class ReLUActivation(torch.nn.Module):
+    def __init__(self, width, l2_bias,
+                 dtype=torch.float32, device=None):
+        super().__init__()
+        self.width = width
+        self.l2_bias = l2_bias
+        self.bias = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+
+    def base_activation(self, X):
+        return torch.clamp_min(X, 0.0)
+
+    def forward(self, X):
+        X1 = X + self.bias
+        return self.base_activation(X1), self.base_activation(-X1)
+
+    def penalty(self):
+        return self.l2_bias * torch.sum(self.bias ** 2)
+
+
 
 class FlexibleActivation(torch.nn.Module):
     def __init__(self, width, neutral_curvature,
@@ -32,6 +51,37 @@ class FlexibleActivation(torch.nn.Module):
 
         return torch.where(X > t, X - t + y0,
                            1 / c * (1 / math.sqrt(2) - torch.cos(math.pi / 4 + c * X1)))
+
+    def forward(self, X):
+        X1 = X + self.bias
+        return self.base_activation(X1), self.base_activation(-X1)
+
+    def penalty(self):
+        return self.l2_bias * torch.sum(self.bias ** 2) + \
+                self.l2_curvature * torch.sum(self.curvature ** 2)
+
+
+class FlexibleQuadraticActivation(torch.nn.Module):
+    def __init__(self, width, neutral_curvature,
+                 l2_curvature, l2_bias,
+                 dtype=torch.float32, device=None):
+        super().__init__()
+        self.width = width
+        self.neutral_curvature = neutral_curvature
+        self.l2_curvature = l2_curvature
+        self.l2_bias = l2_bias
+        self.bias = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.curvature = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+
+    def base_activation(self, X):
+        # Transform `curvature` onto a scale between 0 and infinity
+        c = 0.5 * self.neutral_curvature * (self.curvature + torch.sqrt(self.curvature ** 2 + 1))
+
+        # Compute the positive threshold beyond which the activation becomes linear
+        t = 0.5 / c
+
+        u = torch.max(X, -t)
+        return torch.where(u > t, u, 0.25 / t * (u + t) ** 2) #- 0.25 * t
 
     def forward(self, X):
         X1 = X + self.bias
@@ -76,6 +126,14 @@ class Sponge(torch.nn.Module):
         self.dtype = dtype
         self.angles = torch.nn.Parameter(torch.rand([depth, butterfly_depth, sponge_size // 2], dtype=dtype, device=device) * 2 * math.pi)
         self.scales = torch.nn.Parameter(torch.full([input_size], 1.0, dtype=dtype, device=device))
+        # self.activations = torch.nn.ModuleList([FlexibleQuadraticActivation(
+        #     width=activation_size,
+        #     neutral_curvature=neutral_curvature,
+        #     l2_curvature=l2_curvature,
+        #     l2_bias=l2_bias,
+        #     dtype=dtype,
+        #     device=device,
+        # ) for _ in range(depth)])
         self.activations = torch.nn.ModuleList([FlexibleActivation(
             width=activation_size,
             neutral_curvature=neutral_curvature,
@@ -84,6 +142,12 @@ class Sponge(torch.nn.Module):
             dtype=dtype,
             device=device,
         ) for _ in range(depth)])
+        # self.activations = torch.nn.ModuleList([ReLUActivation(
+        #     width=activation_size,
+        #     l2_bias=l2_bias,
+        #     dtype=dtype,
+        #     device=device,
+        # ) for _ in range(depth)])
 
         # Generate the permutation to use for the perfect shuffle (aka Faro shuffle)
         self.shuffle_perm = torch.zeros([sponge_size], dtype=torch.long)
@@ -102,12 +166,13 @@ class Sponge(torch.nn.Module):
             unused_set.difference_update(elements)
 
         # Set up the butterfly for the output
-        bf_size = len(unused_set) + sponge_size
-        bf_depth = int(math.ceil(math.log2(bf_size)))
+        # bf_size = len(unused_set) + sponge_size
+        # bf_depth = int(math.ceil(math.log2(bf_size)))
+        # self.output_memory_list = sorted(unused_set)
+        #
+        # self.output_butterfly = OrthogonalButterfly(bf_size, bf_depth, l2_interact=l2_interact, dtype=dtype,
+        #                                             device=device)
         self.output_memory_list = sorted(unused_set)
-
-        self.output_butterfly = OrthogonalButterfly(bf_size, bf_depth, l2_interact=l2_interact, dtype=dtype,
-                                                    device=device)
 
     def fetch_memory(self, memory, j):
         """Fetch the j-th column from the memory list of tensors, as if `memory` were concatenated
@@ -171,15 +236,16 @@ class Sponge(torch.nn.Module):
 
             # Create the next iteration of the sponge
             sponge = torch.cat([
+                *recall,
                 act_out,
                 sponge[:, self.store_size:self.activation_position],
                 sponge[:, (self.activation_position + self.activation_size):],
-                *recall,
             ], dim=1)
 
         pre_output = torch.cat([self.fetch_memory(memory, j).view(-1, 1) for j in self.output_memory_list] + [sponge], dim=1)
-        output = self.output_butterfly(pre_output)
-        return output[:, :self.output_size]
+        # output = self.output_butterfly(pre_output)
+        # return output[:, :self.output_size]
+        return pre_output[:, -self.output_size:]
 
     def penalty(self):
         return self.l2_scale * torch.sum(self.scales ** 2) + \

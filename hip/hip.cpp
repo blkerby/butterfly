@@ -4,10 +4,11 @@
 using namespace std::chrono; 
 using namespace std;
 
-#define ROWS_PER_THREAD 4
-#define ANGLES_PER_THREAD_POW 0
-#define ANGLES_PER_THREAD (1 << ANGLES_PER_THREAD_POW)
-#define COLS_PER_THREAD (2 * ANGLES_PER_THREAD)
+#define ROWS_PER_THREAD 11
+// #define ANGLES_PER_THREAD_POW 0
+// #define ANGLES_PER_THREAD (1 << ANGLES_PER_THREAD_POW)
+// #define COLS_PER_THREAD (2 * ANGLES_PER_THREAD)
+#define COLS_PER_THREAD 1
 
 #define HIP_CHECK(cmd)                                                                             \
     {                                                                                              \
@@ -46,30 +47,17 @@ __forceinline__ __device__ void butterfly_layer_forward(T *sponge, T cosine, T s
 }
 
 template <typename T>
-__global__ void __launch_bounds__(64, 1) sponge_forward(
-	T *g_sponge, 
-	const T *g_angles, 
+__global__ void sponge_forward(
+	T * __restrict__  g_sponge, 
+	// const T *g_angles, 
+	const T * __restrict__ g_cosines, 
+	const T * __restrict__ g_sines, 
 	int num_layers,
 	int rows_per_thread,
 	int angles_per_thread_pow
 ) {
 	HIP_DYNAMIC_SHARED(T, tmp)
-	T sponge0_0;
-	T sponge0_1;
-	T sponge0_2;
-	T sponge0_3;
-	T sponge0_4;
-	T sponge0_5;
-	T sponge0_6;
-	T sponge0_7;
-	T sponge1_0;
-	T sponge1_1;
-	T sponge1_2;
-	T sponge1_3;
-	T sponge1_4;
-	T sponge1_5;
-	T sponge1_6;
-	T sponge1_7;
+	T sponge[ROWS_PER_THREAD];
 	int angles_per_thread = 1 << angles_per_thread_pow;
 	int cols_per_thread_pow = angles_per_thread_pow + 1;
 	int cols_per_thread = angles_per_thread * 2;
@@ -77,120 +65,48 @@ __global__ void __launch_bounds__(64, 1) sponge_forward(
 	int j = 0;
 
 	// Load sponge data from global memory into registers
-	// #pragma unroll
-	// for (int i = 0; i < ROWS_PER_THREAD; i++) {
-	// 	if (i >= rows_per_thread) break;
-	// 	int offset = hipThreadIdx_x + hipBlockDim_x * COLS_PER_THREAD * (hipBlockIdx_x + i * hipGridDim_x);
-	// 	sponge0[i] = g_sponge[offset];
-	// 	sponge1[i] = g_sponge[offset + hipBlockDim_x];
-	// }
-	// Tried making `sponge` an array (2D, or group of 1Ds) but loop unrolling didn't work, so we unroll this manually:
-	int offset = hipThreadIdx_x + hipBlockDim_x * COLS_PER_THREAD * hipBlockIdx_x;
-	int step = hipBlockDim_x * COLS_PER_THREAD * hipGridDim_x;
+	int offset = hipThreadIdx_x + hipBlockDim_x * ROWS_PER_THREAD * hipBlockIdx_x;
+	int step = hipBlockDim_x;
 	T *g_in = &g_sponge[offset];
-	sponge0_0 = g_in[0];
-	sponge1_0 = g_in[hipBlockDim_x];
-	g_in += step;
-	sponge0_1 = g_in[0];
-	sponge1_1 = g_in[hipBlockDim_x];
-	g_in += step;
-	sponge0_2 = g_in[0];
-	sponge1_2 = g_in[hipBlockDim_x];
-	g_in += step;
-	sponge0_3 = g_in[0];
-	sponge1_3 = g_in[hipBlockDim_x];
-	// g_in += step;
-	// sponge0_4 = g_in[0];
-	// sponge1_4 = g_in[hipBlockDim_x];
-	// g_in += step;
-	// sponge0_5 = g_in[0];
-	// sponge1_5 = g_in[hipBlockDim_x];
-	// g_in += step;
-	// sponge0_6 = g_in[0];
-	// sponge1_6 = g_in[hipBlockDim_x];
-	// g_in += step;
-	// sponge0_7 = g_in[0];
-	// sponge1_7 = g_in[hipBlockDim_x];
+	#pragma unroll
+	for (int i = 0; i < ROWS_PER_THREAD; i++) {
+		sponge[i] = g_in[0];
+		g_in += step;
+	}
 
-
+	int idx = hipThreadIdx_x;
 	for (int j = 0; j < num_layers; j++) {
 		stride = 1;
 	// 	// Compute angle sine and cosine
-		T angle = g_angles[hipThreadIdx_x + hipBlockDim_x * ANGLES_PER_THREAD * j];
-		// 	T angle = 0.0;
-		T cosine = cos(angle);
-		T sine = sin(angle);
+		// int idx = hipThreadIdx_x + hipBlockDim_x * ANGLES_PER_THREAD * j;
+		// T angle = g_angles[idx];
+		// T cosine = cos(angle);
+		// T sine = sin(angle);
+		T cosine = g_cosines[idx];
+		T sine = g_sines[idx];
+		T neg_sine = -sine;
 		T x0, y0, x1, y1;
-		
-		x0 = sponge0_0;
-		y0 = sponge1_0;
-		sponge0_0 = cosine * x0 + sine * y0;
-		sponge1_0 = -sine * x0 + cosine * y0;
+		idx += hipBlockDim_x;
 
-		x0 = sponge0_1;
-		y0 = sponge1_1;
-		sponge0_1 = cosine * x0 + sine * y0;
-		sponge1_1 = -sine * x0 + cosine * y0;
-
-		x0 = sponge0_2;
-		y0 = sponge1_2;
-		sponge0_2 = cosine * x0 + sine * y0;
-		sponge1_2 = -sine * x0 + cosine * y0;
-
-		x0 = sponge0_3;
-		y0 = sponge1_3;
-		sponge0_3 = cosine * x0 + sine * y0;
-		sponge1_3 = -sine * x0 + cosine * y0;
-
-		// x0 = sponge0_4;
-		// y0 = sponge1_4;
-		// sponge0_4 = cosine * x0 + sine * y0;
-		// sponge1_4 = -sine * x0 + cosine * y0;
-
-		// x0 = sponge0_5;
-		// y0 = sponge1_5;
-		// sponge0_5 = cosine * x0 + sine * y0;
-		// sponge1_5 = -sine * x0 + cosine * y0;
-
-		// x0 = sponge0_6;
-		// y0 = sponge1_6;
-		// sponge0_6 = cosine * x0 + sine * y0;
-		// sponge1_6 = -sine * x0 + cosine * y0;
-
-		// x0 = sponge0_7;
-		// y0 = sponge1_7;
-		// sponge0_7 = cosine * x0 + sine * y0;
-		// sponge1_7 = -sine * x0 + cosine * y0;
+		#pragma unroll
+		for (int i = 0; i < ROWS_PER_THREAD; i++) {
+			x0 = sponge[i];
+			y0 = __shfl_xor(sponge[i], 1);
+			sponge[i] = cosine * x0 + sine * y0;
+		}		
 
 		// Perform iterated Faro shuffle
 
+		// __syncthreads();
 	}
 
 	// Store sponge data into global memory from registers
 	T *g_out = &g_sponge[offset];
-	g_out[0] = sponge0_0 + 1;
-	g_out[hipBlockDim_x] = sponge1_0 + 1;
-	g_out += step;
-	g_out[0] = sponge0_1 + 1;
-	g_out[hipBlockDim_x] = sponge1_1 + 1;
-	g_out += step;
-	g_out[0] = sponge0_2 + 1;
-	g_out[hipBlockDim_x] = sponge1_2 + 1;
-	g_out += step;
-	g_out[0] = sponge0_3 + 1;
-	g_out[hipBlockDim_x] = sponge1_3 + 1;
-	// g_out += step;
-	// g_out[0] = sponge0_4 + 1;
-	// g_out[hipBlockDim_x] = sponge1_4 + 1;
-	// g_out += step;
-	// g_out[0] = sponge0_5 + 1;
-	// g_out[hipBlockDim_x] = sponge1_5 + 1;
-	// g_out += step;
-	// g_out[0] = sponge0_6 + 1;
-	// g_out[hipBlockDim_x] = sponge1_6 + 1;
-	// g_out += step;
-	// g_out[0] = sponge0_7 + 1;
-	// g_out[hipBlockDim_x] = sponge1_7 + 1;
+	#pragma unroll
+	for (int i = 0; i < ROWS_PER_THREAD; i++) {
+		g_out[0] = sponge[i] + 1;
+		g_out += step;
+	}
 }
 
 
@@ -198,12 +114,18 @@ __global__ void __launch_bounds__(64, 1) sponge_forward(
 // // __global__ void sponge_forward(T *data, )
 
 int main() {
-	float *h_angles, *h_data;
-	float *d_angles, *d_data;
-	size_t num_rows = 1<<22;
-	size_t num_cols = 512;
+	// float *h_angles;
+	float *h_cosines;
+	float *h_sines;
+	float *h_data;
+	// float *d_angles;
+	float *d_cosines;
+	float *d_sines;
+	float *d_data;
+	size_t num_rows = 1<<24;
+	size_t num_cols = 128;
 	size_t angles_per_layer = num_cols / 2;
-	size_t num_layers = 64;
+	size_t num_layers = 1024;
 	size_t size_angles = num_layers * angles_per_layer * sizeof(float);
 	size_t size_row = num_cols * sizeof(float);
 	size_t size_data = num_rows * size_row;
@@ -213,32 +135,45 @@ int main() {
 	int angles_per_thread = 1 << angles_per_thread_pow;
 
 	cout << "size_data=" << size_data << endl;
-	h_angles = (float *)malloc(size_angles);
+	// h_angles = (float *)malloc(size_angles);
+	h_cosines = (float *)malloc(size_angles);
+	h_sines = (float *)malloc(size_angles);
 	h_data = (float *)malloc(size_data);
-	HIP_CHECK(hipMalloc(&d_angles, size_angles));
+	if (!h_cosines || !h_sines || !h_data) {
+		cout << "Failed to allocate host memory" << endl;
+		return 1;
+	}
+	// HIP_CHECK(hipMalloc(&d_angles, size_angles));
+	HIP_CHECK(hipMalloc(&d_cosines, size_angles));
+	HIP_CHECK(hipMalloc(&d_sines, size_angles));
 	HIP_CHECK(hipMalloc(&d_data, size_data));
 
 	for (int i = 0; i < num_rows * num_cols; i++) {
 		h_data[i] = i;
 	}
 	for (int i = 0; i < angles_per_layer * num_layers; i++) {
-		h_angles[i] = 0.01;
+		// h_angles[i] = 0.01;
+		h_cosines[i] = cos(0.01);
+		h_sines[i] = sin(0.01);
 	}
 
-	HIP_CHECK(hipMemcpy(d_angles, h_angles, size_angles, hipMemcpyHostToDevice));
+	// HIP_CHECK(hipMemcpy(d_angles, h_angles, size_angles, hipMemcpyHostToDevice));
+	HIP_CHECK(hipMemcpy(d_cosines, h_cosines, size_angles, hipMemcpyHostToDevice));
+	HIP_CHECK(hipMemcpy(d_sines, h_sines, size_angles, hipMemcpyHostToDevice));
 	HIP_CHECK(hipMemcpy(d_data, h_data, size_data, hipMemcpyHostToDevice));
 	HIP_CHECK(hipDeviceSynchronize());
 
 
 	cout << "Starting" << endl;
 	const unsigned blocks = num_rows / rows_per_thread;
-	const unsigned threads_per_block = angles_per_layer / angles_per_thread;
+	const unsigned threads_per_block = num_cols;
 
 	cout << "blocks=" << blocks << ", threads_per_block=" << threads_per_block << endl;
 	auto start = high_resolution_clock::now(); 
 	for (int i = 0; i < rounds + 1; i++) {
-		hipLaunchKernelGGL(sponge_forward, dim3(blocks), dim3(threads_per_block), size_row, 0, d_data, d_angles, num_layers, rows_per_thread, angles_per_thread_pow); 
-		if (i == 1) {
+		// hipLaunchKernelGGL(sponge_forward, dim3(blocks), dim3(threads_per_block), size_row, 0, d_data, d_angles, num_layers, rows_per_thread, angles_per_thread_pow); 
+		hipLaunchKernelGGL(sponge_forward, dim3(blocks), dim3(threads_per_block), size_row, 0, d_data, d_cosines, d_sines, num_layers, rows_per_thread, angles_per_thread_pow); 
+		if (i == 0) {
 			HIP_CHECK(hipDeviceSynchronize());
 			start = high_resolution_clock::now(); 
 		}
