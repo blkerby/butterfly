@@ -4,7 +4,8 @@
 using namespace std::chrono; 
 using namespace std;
 
-#define ROWS_PER_THREAD 11
+#define WARP_SIZE_POW 6
+#define ROWS_PER_THREAD 8
 // #define ANGLES_PER_THREAD_POW 0
 // #define ANGLES_PER_THREAD (1 << ANGLES_PER_THREAD_POW)
 // #define COLS_PER_THREAD (2 * ANGLES_PER_THREAD)
@@ -62,6 +63,7 @@ __global__ void sponge_forward(
 	int cols_per_thread_pow = angles_per_thread_pow + 1;
 	int cols_per_thread = angles_per_thread * 2;
 	int stride = 1;
+	int stride_pow = 0;
 	int j = 0;
 
 	// Load sponge data from global memory into registers
@@ -74,10 +76,10 @@ __global__ void sponge_forward(
 		g_in += step;
 	}
 
-	int idx = hipThreadIdx_x;
 	for (int j = 0; j < num_layers; j++) {
-		stride = 1;
 	// 	// Compute angle sine and cosine
+		int idx = ((hipThreadIdx_x >> (stride_pow + 1)) << stride_pow) | (hipThreadIdx_x & (stride - 1));
+	
 		// int idx = hipThreadIdx_x + hipBlockDim_x * ANGLES_PER_THREAD * j;
 		// T angle = g_angles[idx];
 		// T cosine = cos(angle);
@@ -86,17 +88,27 @@ __global__ void sponge_forward(
 		T sine = g_sines[idx];
 		T neg_sine = -sine;
 		T x0, y0, x1, y1;
-		idx += hipBlockDim_x;
+		idx += hipBlockDim_x / 2;
 
 		#pragma unroll
 		for (int i = 0; i < ROWS_PER_THREAD; i++) {
 			x0 = sponge[i];
-			y0 = __shfl_xor(sponge[i], 1);
-			sponge[i] = cosine * x0 + sine * y0;
+			y0 = __shfl_xor(sponge[i], stride);
+			if ((hipThreadIdx_x & stride) == 0){
+				sponge[i] = cosine * x0 + sine * y0;
+			} else {
+				sponge[i] = cosine * x0 - sine * y0;
+			}
 		}		
 
 		// Perform iterated Faro shuffle
-
+		if (stride_pow == WARP_SIZE_POW) {
+			stride_pow = 0;
+			stride = 1;
+		} else {
+			stride_pow++;
+			stride *= 2;
+		}
 		// __syncthreads();
 	}
 
@@ -104,7 +116,7 @@ __global__ void sponge_forward(
 	T *g_out = &g_sponge[offset];
 	#pragma unroll
 	for (int i = 0; i < ROWS_PER_THREAD; i++) {
-		g_out[0] = sponge[i] + 1;
+		g_out[0] = sponge[i];
 		g_out += step;
 	}
 }
@@ -122,14 +134,14 @@ int main() {
 	float *d_cosines;
 	float *d_sines;
 	float *d_data;
-	size_t num_rows = 1<<24;
-	size_t num_cols = 128;
+	size_t num_rows = 1 << 20;
+	size_t num_cols = 256;
 	size_t angles_per_layer = num_cols / 2;
-	size_t num_layers = 1024;
+	size_t num_layers = 128;
 	size_t size_angles = num_layers * angles_per_layer * sizeof(float);
 	size_t size_row = num_cols * sizeof(float);
 	size_t size_data = num_rows * size_row;
-	int rounds = 10;
+	int rounds = 1;
 	int rows_per_thread = ROWS_PER_THREAD;
 	int angles_per_thread_pow = 0;
 	int angles_per_thread = 1 << angles_per_thread_pow;
