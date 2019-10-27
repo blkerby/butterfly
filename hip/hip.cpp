@@ -5,7 +5,7 @@ using namespace std::chrono;
 using namespace std;
 
 #define WARP_SIZE_POW 6
-#define ROWS_PER_THREAD 8
+#define ROWS_PER_THREAD 12
 // #define ANGLES_PER_THREAD_POW 0
 // #define ANGLES_PER_THREAD (1 << ANGLES_PER_THREAD_POW)
 // #define COLS_PER_THREAD (2 * ANGLES_PER_THREAD)
@@ -55,13 +55,11 @@ __global__ void sponge_forward(
 	const T * __restrict__ g_sines, 
 	int num_layers,
 	int rows_per_thread,
-	int angles_per_thread_pow
+	int num_cols_pow
 ) {
 	HIP_DYNAMIC_SHARED(T, tmp)
 	T sponge[ROWS_PER_THREAD];
-	int angles_per_thread = 1 << angles_per_thread_pow;
-	int cols_per_thread_pow = angles_per_thread_pow + 1;
-	int cols_per_thread = angles_per_thread * 2;
+	int num_cols = 1 << num_cols_pow;
 	int stride = 1;
 	int stride_pow = 0;
 	int j = 0;
@@ -97,17 +95,24 @@ __global__ void sponge_forward(
 			if ((hipThreadIdx_x & stride) == 0){
 				sponge[i] = cosine * x0 + sine * y0;
 			} else {
-				sponge[i] = cosine * x0 - sine * y0;
+				sponge[i] = cosine * x0 + neg_sine * y0;
 			}
 		}		
 
 		// Perform iterated Faro shuffle
-		if (stride_pow == WARP_SIZE_POW) {
+		stride_pow++;
+		stride *= 2;
+		if (stride_pow == WARP_SIZE_POW || j == num_layers - 1) {
+			int srcIdx = ((hipThreadIdx_x << stride_pow) & (num_cols - 1))| (hipThreadIdx_x >> (num_cols_pow - stride_pow));
+			for (int i = 0; i < ROWS_PER_THREAD; i++) {
+				tmp[hipThreadIdx_x] = sponge[i];
+				__syncthreads();
+				sponge[i] = tmp[srcIdx];
+				__syncthreads();
+			}
+
 			stride_pow = 0;
 			stride = 1;
-		} else {
-			stride_pow++;
-			stride *= 2;
 		}
 		// __syncthreads();
 	}
@@ -135,9 +140,10 @@ int main() {
 	float *d_sines;
 	float *d_data;
 	size_t num_rows = 1 << 20;
-	size_t num_cols = 256;
+	size_t num_cols_pow = 8;
+	size_t num_cols = 1 << num_cols_pow;
 	size_t angles_per_layer = num_cols / 2;
-	size_t num_layers = 128;
+	size_t num_layers = 127;
 	size_t size_angles = num_layers * angles_per_layer * sizeof(float);
 	size_t size_row = num_cols * sizeof(float);
 	size_t size_data = num_rows * size_row;
@@ -184,7 +190,7 @@ int main() {
 	auto start = high_resolution_clock::now(); 
 	for (int i = 0; i < rounds + 1; i++) {
 		// hipLaunchKernelGGL(sponge_forward, dim3(blocks), dim3(threads_per_block), size_row, 0, d_data, d_angles, num_layers, rows_per_thread, angles_per_thread_pow); 
-		hipLaunchKernelGGL(sponge_forward, dim3(blocks), dim3(threads_per_block), size_row, 0, d_data, d_cosines, d_sines, num_layers, rows_per_thread, angles_per_thread_pow); 
+		hipLaunchKernelGGL(sponge_forward, dim3(blocks), dim3(threads_per_block), size_row, 0, d_data, d_cosines, d_sines, num_layers, rows_per_thread, num_cols_pow); 
 		if (i == 0) {
 			HIP_CHECK(hipDeviceSynchronize());
 			start = high_resolution_clock::now(); 
