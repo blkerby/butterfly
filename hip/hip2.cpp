@@ -18,7 +18,7 @@
 #define BRICK_THREADS_PER_BLOCK 2
 
 template <typename T>
-__global__ void butterfly_brick_slow(
+__global__ void butterfly_brick_forward_slow(
     T *g_data,
     const int *g_idx_in,
     const int idx_out,
@@ -57,13 +57,9 @@ __global__ void butterfly_brick_slow(
     // data in registers and just use warp shuffles to exchange across threads where necessary, or maybe even
     // just use a small enough brick that the full width can fit entirely in one thread's registers, so
     // no cross-thread communication would be necessary at all.)
-    stride_pow = (BRICK_INPUT_WIDTH_POW - 1) * butterfly_depth_in % BRICK_INPUT_WIDTH_POW;
-    stride = 1 << stride_pow;
     for (int i = 0; i < butterfly_depth_in; i++) {
-        if (stride_pow == BRICK_INPUT_WIDTH_POW) {
-            stride_pow = 0;
-            stride = 1;
-        }
+        stride_pow = (i + (BRICK_INPUT_WIDTH_POW - 1) * butterfly_depth_in) % BRICK_INPUT_WIDTH_POW;
+        stride = 1 << stride_pow;
         for (int j = 0; j < BRICK_INPUT_WIDTH / 2 / BRICK_THREADS_PER_BLOCK; j++) {
             int angle_idx = j * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
             T angle = angles[i * BRICK_INPUT_WIDTH / 2 + angle_idx];
@@ -85,8 +81,6 @@ __global__ void butterfly_brick_slow(
                 offset_y += BRICK_INPUT_WIDTH * 2;
             }
         }
-        stride_pow++;
-        stride *= 2;
     }
     
     // Perform the double-RELU activations, doubling the width.
@@ -106,10 +100,8 @@ __global__ void butterfly_brick_slow(
 
     // Perform the butterfly on the output
     for (int i = 0; i < butterfly_depth_out; i++) {
-        if (stride_pow == BRICK_INPUT_WIDTH_POW + 1) {
-            stride_pow = 0;
-            stride = 1;
-        }
+        stride_pow = (i + butterfly_depth_in + (BRICK_INPUT_WIDTH_POW - 1) * butterfly_depth_in) % BRICK_INPUT_WIDTH_POW;
+        stride = 1 << stride_pow;
         for (int j = 0; j < BRICK_INPUT_WIDTH / BRICK_THREADS_PER_BLOCK; j++) {
             int angle_idx = butterfly_depth_in * BRICK_INPUT_WIDTH / 2 + j * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
             T angle = angles[i * BRICK_INPUT_WIDTH + angle_idx];
@@ -131,8 +123,6 @@ __global__ void butterfly_brick_slow(
                 offset_y += BRICK_INPUT_WIDTH * 2;
             }
         }
-        stride_pow++;
-        stride *= 2;
     }
 
     // Store the batch of data into global memory from shared memory
@@ -143,6 +133,112 @@ __global__ void butterfly_brick_slow(
         int row = idx % BRICK_BATCH_SIZE;
         s_data_ptr[col][row] = s_data[row * BRICK_INPUT_WIDTH * 2 + col];
         out_ptr[col * num_rows + row] = s_data[row * BRICK_INPUT_WIDTH * 2 + col + BRICK_INPUT_WIDTH];
+    }
+}
+
+
+template <typename T>
+__global__ void butterfly_brick_backward_slow(
+    T *g_data,
+    const int *g_idx_in,
+    const int idx_out,
+    T *angles, 
+    int num_rows,
+    int butterfly_depth_in,
+    int butterfly_depth_out
+) {
+    __shared__ T s_data[2 * BRICK_INPUT_WIDTH * BRICK_BATCH_SIZE];
+    __shared__ T *s_data_ptr[BRICK_INPUT_WIDTH];
+    int stride;
+    int stride_pow;
+
+    // Load the input data pointers from global memory into shared memory.
+    // (After this loop, even though the pointers themselves will be in shared memory they will
+    // still point to global memory.)
+    for (int i = 0; i < BRICK_INPUT_WIDTH / BRICK_THREADS_PER_BLOCK; i++) {
+        s_data_ptr[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x] = g_data + num_rows * g_idx_in[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x];
+    }
+
+    // Load the batch of data from global memory into shared memory
+    T *out_ptr = g_data + num_rows * idx_out;
+    for (int i = 0; i < BRICK_INPUT_WIDTH * BRICK_BATCH_SIZE / BRICK_THREADS_PER_BLOCK; i++) {
+        int idx = i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
+        int col = idx / BRICK_BATCH_SIZE;
+        int row = idx % BRICK_BATCH_SIZE;
+        s_data[row * BRICK_INPUT_WIDTH * 2 + col] = s_data_ptr[col][row];
+        s_data[row * BRICK_INPUT_WIDTH * 2 + col + BRICK_INPUT_WIDTH] = out_ptr[col * num_rows + row];
+    }
+
+    // Perform the reverse butterfly on the output
+    for (int i = butterfly_depth_out - 1; i >= 0; i--) {
+        stride_pow = (i + butterfly_depth_in + (BRICK_INPUT_WIDTH_POW - 1) * butterfly_depth_in) % BRICK_INPUT_WIDTH_POW;
+        stride = 1 << stride_pow;
+        for (int j = 0; j < BRICK_INPUT_WIDTH / BRICK_THREADS_PER_BLOCK; j++) {
+            int angle_idx = butterfly_depth_in * BRICK_INPUT_WIDTH / 2 + j * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
+            T angle = angles[i * BRICK_INPUT_WIDTH + angle_idx];
+            T cosine = cos(angle);
+            T sine = sin(angle);
+            int data_idx_x = ((angle_idx << (stride_pow + 1)) & (BRICK_INPUT_WIDTH * 2 - 1)) | 
+                ((angle_idx >> (BRICK_INPUT_WIDTH_POW - stride_pow)) & (stride - 1));
+            int data_idx_y = data_idx_x ^ stride;
+            int offset_x = data_idx_x;
+            int offset_y = data_idx_y;
+            for (int k = 0; k < BRICK_BATCH_SIZE; k++) {
+                T x0 = s_data[offset_x];
+                T y0 = s_data[offset_y];
+                T x1 = cosine * x0 + -sine * y0;
+                T y1 = sine * x0 + cosine * y0;
+                s_data[offset_x] = x1;
+                s_data[offset_y] = y1;
+                offset_x += BRICK_INPUT_WIDTH * 2;
+                offset_y += BRICK_INPUT_WIDTH * 2;
+            }
+        }
+    }
+
+
+    // Reverse the double-RELU activations.
+    for (int j = 0; j < BRICK_INPUT_WIDTH / BRICK_THREADS_PER_BLOCK; j++) {
+        int idx = j * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
+        for (int k = 0; k < BRICK_BATCH_SIZE; k++) {
+            s_data[idx] += s_data[idx + BRICK_INPUT_WIDTH];
+            idx += BRICK_INPUT_WIDTH * 2;
+        }
+    }
+
+    // Perform the reverse butterfly on the input:
+    for (int i = butterfly_depth_in - 1; i >= 0; i--) {
+        stride_pow = (i + (BRICK_INPUT_WIDTH_POW - 1) * butterfly_depth_in) % BRICK_INPUT_WIDTH_POW;
+        stride = 1 << stride_pow;
+        for (int j = 0; j < BRICK_INPUT_WIDTH / 2 / BRICK_THREADS_PER_BLOCK; j++) {
+            int angle_idx = j * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
+            T angle = angles[i * BRICK_INPUT_WIDTH / 2 + angle_idx];
+            T cosine = cos(angle);
+            T sine = sin(angle);
+            int data_idx_x = ((angle_idx << (stride_pow + 1)) & (BRICK_INPUT_WIDTH - 1)) | 
+                ((angle_idx >> (BRICK_INPUT_WIDTH_POW - 1 - stride_pow)) & (stride - 1));
+            int data_idx_y = data_idx_x ^ stride;
+            int offset_x = data_idx_x;
+            int offset_y = data_idx_y;
+            for (int k = 0; k < BRICK_BATCH_SIZE; k++) {
+                T x0 = s_data[offset_x];
+                T y0 = s_data[offset_y];
+                T x1 = cosine * x0 + -sine * y0;
+                T y1 = sine * x0 + cosine * y0;
+                s_data[offset_x] = x1;
+                s_data[offset_y] = y1;
+                offset_x += BRICK_INPUT_WIDTH * 2;
+                offset_y += BRICK_INPUT_WIDTH * 2;
+            }
+        }
+    }
+    
+    // Store the batch of data into global memory from shared memory
+    for (int i = 0; i < BRICK_INPUT_WIDTH * BRICK_BATCH_SIZE / BRICK_THREADS_PER_BLOCK; i++) {
+        int idx = i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
+        int col = idx / BRICK_BATCH_SIZE;
+        int row = idx % BRICK_BATCH_SIZE;
+        s_data_ptr[col][row] = s_data[row * BRICK_INPUT_WIDTH * 2 + col];
     }
 }
 
@@ -207,13 +303,13 @@ int main(int argc, char* argv[]) {
     float *angles_ptr = h_angles;
     for (int i = 0; i < butterfly_depth_in; i++) {
         for (int j = 0; j < BRICK_INPUT_WIDTH / 2; j++) {
-            *angles_ptr = 0.0;
+            *angles_ptr = i * 0.01 + j*0.1;
             angles_ptr++;
         }
     }
     for (int i = 0; i < butterfly_depth_out; i++) {
         for (int j = 0; j < BRICK_INPUT_WIDTH; j++) {
-            *angles_ptr = 0.0;
+            *angles_ptr = i * 0.01 + j*0.1 + 0.12345;
             angles_ptr++;
         }
     }
@@ -232,7 +328,16 @@ int main(int argc, char* argv[]) {
     const dim3 threadsPerBlock(BRICK_THREADS_PER_BLOCK);
 
     printf("info: launch kernel\n");
-    hipLaunchKernelGGL(butterfly_brick_slow, blocks, threadsPerBlock, 0, 0, 
+    hipLaunchKernelGGL(butterfly_brick_forward_slow, blocks, threadsPerBlock, 0, 0, 
+        d_data,
+        d_idx_in,
+        BRICK_INPUT_WIDTH,
+        d_angles, 
+        num_rows,
+        butterfly_depth_in,
+        butterfly_depth_out);
+
+    hipLaunchKernelGGL(butterfly_brick_backward_slow, blocks, threadsPerBlock, 0, 0, 
         d_data,
         d_idx_in,
         BRICK_INPUT_WIDTH,
