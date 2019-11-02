@@ -57,7 +57,6 @@ __global__ void butterfly_brick_slow(
     // data in registers and just use warp shuffles to exchange across threads where necessary, or maybe even
     // just use a small enough brick that the full width can fit entirely in one thread's registers, so
     // no cross-thread communication would be necessary at all.)
-
     stride_pow = (BRICK_INPUT_WIDTH_POW - 1) * butterfly_depth_in % BRICK_INPUT_WIDTH_POW;
     stride = 1 << stride_pow;
     for (int i = 0; i < butterfly_depth_in; i++) {
@@ -90,19 +89,61 @@ __global__ void butterfly_brick_slow(
         stride *= 2;
     }
     
-    // Perform the activations, doubling the width.
+    // Perform the double-RELU activations, doubling the width.
+    for (int j = 0; j < BRICK_INPUT_WIDTH / BRICK_THREADS_PER_BLOCK; j++) {
+        int idx = j * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
+        for (int k = 0; k < BRICK_BATCH_SIZE; k++) {
+            float x = s_data[idx];
+            if (x > 0.0) {
+                s_data[idx + BRICK_INPUT_WIDTH] = 0.0;
+            } else {
+                s_data[idx + BRICK_INPUT_WIDTH] = x;
+                s_data[idx] = 0.0;
+            }
+            idx += BRICK_INPUT_WIDTH * 2;
+        }
+    }
 
     // Perform the butterfly on the output
+    for (int i = 0; i < butterfly_depth_out; i++) {
+        if (stride_pow == BRICK_INPUT_WIDTH_POW + 1) {
+            stride_pow = 0;
+            stride = 1;
+        }
+        for (int j = 0; j < BRICK_INPUT_WIDTH / BRICK_THREADS_PER_BLOCK; j++) {
+            int angle_idx = butterfly_depth_in * BRICK_INPUT_WIDTH / 2 + j * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
+            T angle = angles[i * BRICK_INPUT_WIDTH + angle_idx];
+            T cosine = cos(angle);
+            T sine = sin(angle);
+            int data_idx_x = ((angle_idx << (stride_pow + 1)) & (BRICK_INPUT_WIDTH * 2 - 1)) | 
+                ((angle_idx >> (BRICK_INPUT_WIDTH_POW - stride_pow)) & (stride - 1));
+            int data_idx_y = data_idx_x ^ stride;
+            int offset_x = data_idx_x;
+            int offset_y = data_idx_y;
+            for (int k = 0; k < BRICK_BATCH_SIZE; k++) {
+                T x0 = s_data[offset_x];
+                T y0 = s_data[offset_y];
+                T x1 = cosine * x0 + sine * y0;
+                T y1 = -sine * x0 + cosine * y0;
+                s_data[offset_x] = x1;
+                s_data[offset_y] = y1;
+                offset_x += BRICK_INPUT_WIDTH * 2;
+                offset_y += BRICK_INPUT_WIDTH * 2;
+            }
+        }
+        stride_pow++;
+        stride *= 2;
+    }
 
     // Store the batch of data into global memory from shared memory
+    T *out_ptr = g_data + num_rows * idx_out;
     for (int i = 0; i < BRICK_INPUT_WIDTH * BRICK_BATCH_SIZE / BRICK_THREADS_PER_BLOCK; i++) {
         int idx = i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
         int col = idx / BRICK_BATCH_SIZE;
         int row = idx % BRICK_BATCH_SIZE;
         s_data_ptr[col][row] = s_data[row * BRICK_INPUT_WIDTH * 2 + col];
+        out_ptr[col * num_rows + row] = s_data[row * BRICK_INPUT_WIDTH * 2 + col + BRICK_INPUT_WIDTH];
     }
-
-
 }
 
 
@@ -128,8 +169,8 @@ int main(int argc, char* argv[]) {
     int *d_idx_in;
     int num_rows = 16;
     int num_cols = BRICK_INPUT_WIDTH * 2;
-    int butterfly_depth_in = 2;
-    int butterfly_depth_out = 1;
+    int butterfly_depth_in = BRICK_INPUT_WIDTH_POW;
+    int butterfly_depth_out = BRICK_INPUT_WIDTH_POW + 1;
     int data_size = num_rows * num_cols * sizeof(float);
     int angles_size = (BRICK_INPUT_WIDTH / 2 * butterfly_depth_in + BRICK_INPUT_WIDTH * butterfly_depth_out) * sizeof(float);
     int idx_in_size = BRICK_INPUT_WIDTH * sizeof(int);
@@ -157,8 +198,10 @@ int main(int argc, char* argv[]) {
     HIP_CHECK(hipMalloc(&d_angles, angles_size));
     HIP_CHECK(hipMalloc(&d_idx_in, idx_in_size));
 
-    for (int i = 0; i < num_rows * num_cols; i++) {
-        h_data[i] = i;
+    for (int i = 0; i < num_rows; i++) {
+        for (int j = 0; j < num_cols; j++) {
+            h_data[j * num_rows + i] = j * (i % 2 * 2 - 1);
+        }
     }
     
     float *angles_ptr = h_angles;
@@ -174,7 +217,7 @@ int main(int argc, char* argv[]) {
             angles_ptr++;
         }
     }
-    h_angles[3] = 0.01;
+    h_angles[11] = 0.01;
 
     for (int i = 0; i < BRICK_INPUT_WIDTH; i++) {
         h_idx_in[i] = i;
