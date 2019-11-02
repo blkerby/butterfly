@@ -5,7 +5,7 @@ using namespace std::chrono;
 using namespace std;
 
 #define WARP_SIZE_POW 6
-#define ROWS_PER_THREAD 12
+#define ROWS_PER_THREAD 24
 // #define ANGLES_PER_THREAD_POW 0
 // #define ANGLES_PER_THREAD (1 << ANGLES_PER_THREAD_POW)
 // #define COLS_PER_THREAD (2 * ANGLES_PER_THREAD)
@@ -32,20 +32,20 @@ using namespace std;
 //     }
 // }
 
-template <typename T>
-__forceinline__ __device__ void butterfly_layer_forward(T *sponge, T cosine, T sine) {
-	size_t i = hipThreadIdx_x;
-	T x0 = sponge[2 * i];
-	T y0 = sponge[2 * i + 1];
-	// __syncthreads();
-	T x1 = cosine * x0 + sine * y0;
-	T y1 = -sine * x0 + cosine * y0;
-	sponge[i] = x1;
-	sponge[i + hipBlockDim_x] = y1;
-	// sponge[i] = x0;
-	// sponge[i + hipBlockDim_x] = y0;
-	// __syncthreads();
-}
+// template <typename T>
+// __forceinline__ __device__ void butterfly_layer_forward(T *sponge, T cosine, T sine) {
+// 	size_t i = hipThreadIdx_x;
+// 	T x0 = sponge[2 * i];
+// 	T y0 = sponge[2 * i + 1];
+// 	// __syncthreads();
+// 	T x1 = cosine * x0 + sine * y0;
+// 	T y1 = -sine * x0 + cosine * y0;
+// 	sponge[i] = x1;
+// 	sponge[i + hipBlockDim_x] = y1;
+// 	// sponge[i] = x0;
+// 	// sponge[i + hipBlockDim_x] = y0;
+// 	// __syncthreads();
+// }
 
 template <typename T>
 __global__ void sponge_forward(
@@ -75,7 +75,7 @@ __global__ void sponge_forward(
 	}
 
 	for (int j = 0; j < num_layers; j++) {
-	// 	// Compute angle sine and cosine
+		// Compute angle sine and cosine
 		int idx = ((hipThreadIdx_x >> (stride_pow + 1)) << stride_pow) | (hipThreadIdx_x & (stride - 1));
 	
 		// int idx = hipThreadIdx_x + hipBlockDim_x * ANGLES_PER_THREAD * j;
@@ -84,6 +84,8 @@ __global__ void sponge_forward(
 		// T sine = sin(angle);
 		T cosine = g_cosines[idx];
 		T sine = g_sines[idx];
+		// T cosine = 0.99995;
+		// T sine = 0.01;
 		T neg_sine = -sine;
 		T x0, y0, x1, y1;
 		idx += hipBlockDim_x / 2;
@@ -99,10 +101,10 @@ __global__ void sponge_forward(
 			}
 		}		
 
-		// Perform iterated Faro shuffle
 		stride_pow++;
 		stride *= 2;
 		if (stride_pow == WARP_SIZE_POW || j == num_layers - 1) {
+			// Perform iterated Faro shuffle
 			int srcIdx = ((hipThreadIdx_x << stride_pow) & (num_cols - 1))| (hipThreadIdx_x >> (num_cols_pow - stride_pow));
 			for (int i = 0; i < ROWS_PER_THREAD; i++) {
 				tmp[hipThreadIdx_x] = sponge[i];
@@ -139,15 +141,15 @@ int main() {
 	float *d_cosines;
 	float *d_sines;
 	float *d_data;
-	size_t num_rows = 1 << 20;
-	size_t num_cols_pow = 8;
+	size_t num_rows = 1 << 23;
+	size_t num_cols_pow = 6;
 	size_t num_cols = 1 << num_cols_pow;
 	size_t angles_per_layer = num_cols / 2;
-	size_t num_layers = 127;
+	size_t num_layers = 512;
 	size_t size_angles = num_layers * angles_per_layer * sizeof(float);
 	size_t size_row = num_cols * sizeof(float);
 	size_t size_data = num_rows * size_row;
-	int rounds = 1;
+	int rounds = 10;
 	int rows_per_thread = ROWS_PER_THREAD;
 	int angles_per_thread_pow = 0;
 	int angles_per_thread = 1 << angles_per_thread_pow;

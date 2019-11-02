@@ -34,7 +34,8 @@ class FlexibleActivation(torch.nn.Module):
         self.l2_curvature = l2_curvature
         self.l2_bias = l2_bias
         self.bias = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
-        self.curvature = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        # self.curvature = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.curvature = torch.tensor(0.0, dtype=dtype)
 
     def base_activation(self, X):
         # Transform `curvature` onto a scale between 0 and infinity
@@ -71,7 +72,8 @@ class FlexibleQuadraticActivation(torch.nn.Module):
         self.l2_curvature = l2_curvature
         self.l2_bias = l2_bias
         self.bias = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
-        self.curvature = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        # self.curvature = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.curvature = torch.tensor(0.0, dtype=dtype)
 
     def base_activation(self, X):
         # Transform `curvature` onto a scale between 0 and infinity
@@ -82,6 +84,33 @@ class FlexibleQuadraticActivation(torch.nn.Module):
 
         u = torch.max(X, -t)
         return torch.where(u > t, u, 0.25 / t * (u + t) ** 2) #- 0.25 * t
+
+    def forward(self, X):
+        X1 = X + self.bias
+        return self.base_activation(X1), self.base_activation(-X1)
+
+    def penalty(self):
+        return self.l2_bias * torch.sum(self.bias ** 2) + \
+                self.l2_curvature * torch.sum(self.curvature ** 2)
+
+
+class SmoothActivation(torch.nn.Module):
+    def __init__(self, width, neutral_curvature,
+                 l2_curvature, l2_bias,
+                 dtype=torch.float32, device=None):
+        super().__init__()
+        self.width = width
+        self.neutral_curvature = neutral_curvature
+        self.l2_curvature = l2_curvature
+        self.l2_bias = l2_bias
+        self.bias = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        # self.curvature = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.curvature = torch.tensor(0.0, dtype=dtype)
+
+    def base_activation(self, X):
+        # Transform `curvature` onto a scale between 0 and infinity
+        c = 1.0 / (0.5 * self.neutral_curvature * (self.curvature + torch.sqrt(self.curvature ** 2 + 1)))
+        return 0.5 * (X + torch.sqrt(X ** 2 + c ** 2) - c)
 
     def forward(self, X):
         X1 = X + self.bias
@@ -126,6 +155,14 @@ class Sponge(torch.nn.Module):
         self.dtype = dtype
         self.angles = torch.nn.Parameter(torch.rand([depth, butterfly_depth, sponge_size // 2], dtype=dtype, device=device) * 2 * math.pi)
         self.scales = torch.nn.Parameter(torch.full([input_size], 1.0, dtype=dtype, device=device))
+        self.activations = torch.nn.ModuleList([SmoothActivation(
+            width=activation_size,
+            neutral_curvature=neutral_curvature,
+            l2_curvature=l2_curvature,
+            l2_bias=l2_bias,
+            dtype=dtype,
+            device=device,
+        ) for _ in range(depth)])
         # self.activations = torch.nn.ModuleList([FlexibleQuadraticActivation(
         #     width=activation_size,
         #     neutral_curvature=neutral_curvature,
@@ -134,14 +171,14 @@ class Sponge(torch.nn.Module):
         #     dtype=dtype,
         #     device=device,
         # ) for _ in range(depth)])
-        self.activations = torch.nn.ModuleList([FlexibleActivation(
-            width=activation_size,
-            neutral_curvature=neutral_curvature,
-            l2_curvature=l2_curvature,
-            l2_bias=l2_bias,
-            dtype=dtype,
-            device=device,
-        ) for _ in range(depth)])
+        # self.activations = torch.nn.ModuleList([FlexibleActivation(
+        #     width=activation_size,
+        #     neutral_curvature=neutral_curvature,
+        #     l2_curvature=l2_curvature,
+        #     l2_bias=l2_bias,
+        #     dtype=dtype,
+        #     device=device,
+        # ) for _ in range(depth)])
         # self.activations = torch.nn.ModuleList([ReLUActivation(
         #     width=activation_size,
         #     l2_bias=l2_bias,
