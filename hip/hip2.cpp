@@ -1,6 +1,10 @@
 // #include <torch/extension.h>
 #include <stdio.h>
 #include "hip/hip_runtime.h"
+#include <chrono> 
+using namespace std::chrono; 
+using namespace std;
+
 
 #define HIP_CHECK(cmd)                                                                                 \
     {                                                                                              \
@@ -12,12 +16,12 @@
         }                                                                                          \
     }
 
-#define BRICK_INPUT_WIDTH_POW 2
+#define BRICK_INPUT_WIDTH_POW 7
 #define BRICK_INPUT_WIDTH (1 << BRICK_INPUT_WIDTH_POW)
 #define BRICK_BATCH_SIZE 16
-#define BRICK_THREADS_PER_BLOCK 2
-#define BRICK_MAX_INPUT_DEPTH 18
-#define BRICK_MAX_OUTPUT_DEPTH 21
+#define BRICK_THREADS_PER_BLOCK 64
+#define BRICK_MAX_INPUT_DEPTH 7
+#define BRICK_MAX_OUTPUT_DEPTH 8
 
 
 template <typename T>
@@ -39,15 +43,19 @@ __global__ void butterfly_brick_forward_slow(
     // (After this loop, even though the pointers themselves will be in shared memory they will
     // still point to global memory.)
     for (int i = 0; i < BRICK_INPUT_WIDTH / BRICK_THREADS_PER_BLOCK; i++) {
-        s_data_ptr[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x] = g_data + num_rows * g_idx_in[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x];
+        s_data_ptr[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x] = 
+            g_data + BRICK_BATCH_SIZE * hipBlockIdx_x + num_rows * g_idx_in[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x];
     }
 
     // Load the batch of data from global memory into shared memory
+    int row = hipThreadIdx_x % BRICK_BATCH_SIZE;
+    int col = hipThreadIdx_x / BRICK_BATCH_SIZE;
     for (int i = 0; i < BRICK_INPUT_WIDTH * BRICK_BATCH_SIZE / BRICK_THREADS_PER_BLOCK; i++) {
-        int idx = i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
-        int col = idx / BRICK_BATCH_SIZE;
-        int row = idx % BRICK_BATCH_SIZE;
-        s_data[row * BRICK_INPUT_WIDTH * 2 + col] = s_data_ptr[col][row];
+        T *ptr = s_data_ptr[col];
+        int in_idx = row * BRICK_INPUT_WIDTH * 2 + col;
+        __syncthreads();
+        s_data[in_idx] = ptr[row];
+        col += BRICK_THREADS_PER_BLOCK / BRICK_BATCH_SIZE;
     }
 
     // Perform the butterfly on the input:
@@ -131,13 +139,19 @@ __global__ void butterfly_brick_forward_slow(
     }
 
     // Store the batch of data into global memory from shared memory
-    T *data_out_ptr = g_data + num_rows * idx_out;
+    T *data_out_ptr = g_data + BRICK_BATCH_SIZE * hipBlockIdx_x + num_rows * idx_out;
+    col = hipThreadIdx_x / BRICK_BATCH_SIZE;
     for (int i = 0; i < BRICK_INPUT_WIDTH * BRICK_BATCH_SIZE / BRICK_THREADS_PER_BLOCK; i++) {
-        int idx = i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
-        int col = idx / BRICK_BATCH_SIZE;
-        int row = idx % BRICK_BATCH_SIZE;
-        s_data_ptr[col][row] = s_data[row * BRICK_INPUT_WIDTH * 2 + col];
-        data_out_ptr[col * num_rows + row] = s_data[row * BRICK_INPUT_WIDTH * 2 + col + BRICK_INPUT_WIDTH];
+        T *ptr = s_data_ptr[col];
+        T val = s_data[row * BRICK_INPUT_WIDTH * 2 + col];
+        __syncthreads();
+        ptr[row] = val;
+
+        val = s_data[row * BRICK_INPUT_WIDTH * 2 + col + BRICK_INPUT_WIDTH];
+        int idx = col * num_rows + row;
+        __syncthreads();
+        data_out_ptr[idx] = val;
+        col += BRICK_THREADS_PER_BLOCK / BRICK_BATCH_SIZE;
     }
 }
 
@@ -166,8 +180,10 @@ __global__ void butterfly_brick_backward_slow(
     // (After this loop, even though the pointers themselves will be in shared memory they will
     // still point to global memory.)
     for (int i = 0; i < BRICK_INPUT_WIDTH / BRICK_THREADS_PER_BLOCK; i++) {
-        s_data_ptr[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x] = g_data + num_rows * g_idx_in[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x];
-        s_grad_data_ptr[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x] = g_grad_data + num_rows * g_idx_in[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x];
+        s_data_ptr[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x] = 
+            g_data + BRICK_BATCH_SIZE * hipBlockIdx_x + num_rows * g_idx_in[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x];
+        s_grad_data_ptr[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x] = 
+            g_grad_data + BRICK_BATCH_SIZE * hipBlockIdx_x + num_rows * g_idx_in[i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x];
     }
 
     // Load the batch of data and gradients from global memory into shared memory
@@ -295,8 +311,7 @@ __global__ void butterfly_brick_backward_slow(
     for (int i = 0; i < (num_angles + BRICK_THREADS_PER_BLOCK - 1) / BRICK_THREADS_PER_BLOCK; i++) {
         int idx = i * BRICK_THREADS_PER_BLOCK + hipThreadIdx_x;
         if (idx < num_angles) {
-            // atomicAdd(&g_grad_angles[idx], s_grad_angles[idx]);
-            g_grad_angles[idx] = s_grad_angles[idx];
+            atomicAdd(&g_grad_angles[idx], s_grad_angles[idx]);
         }
     }
 }
@@ -322,14 +337,16 @@ int main(int argc, char* argv[]) {
     int *h_idx_in;
     float *d_data, *d_grad_data, *d_angles, *d_grad_angles;
     int *d_idx_in;
-    int num_rows = 16;
+    int rounds = 10;
+    long num_rows = 1 << 18;
     int num_cols = BRICK_INPUT_WIDTH * 2;
-    int butterfly_depth_in = BRICK_INPUT_WIDTH_POW;
-    int butterfly_depth_out = BRICK_INPUT_WIDTH_POW + 1;
-    int data_size = num_rows * num_cols * sizeof(float);
+    int butterfly_depth_in = 2 * BRICK_INPUT_WIDTH_POW;
+    int butterfly_depth_out = 2 * (BRICK_INPUT_WIDTH_POW + 1);
+    long data_size = (long)num_rows * num_cols * sizeof(float);
     int angles_size = (BRICK_INPUT_WIDTH / 2 * butterfly_depth_in + BRICK_INPUT_WIDTH * butterfly_depth_out) * sizeof(float);
     int idx_in_size = BRICK_INPUT_WIDTH * sizeof(int);
     static int device = 0;
+
     hipDeviceProp_t props;
     
     HIP_CHECK(hipSetDevice(device));
@@ -339,7 +356,7 @@ int main(int argc, char* argv[]) {
     printf("info: architecture on AMD GPU device is: %d\n", props.gcnArch);
 #endif
     
-    printf("info: allocate host mem (%6.3f MB)\n", (data_size + angles_size + idx_in_size) / 1000000.0);
+    printf("info: allocate host mem (%6.3f MB)\n", (data_size * 2 + angles_size * 2 + idx_in_size) / 1000000.0);
     h_data = (float *)malloc(data_size);
     h_grad_data = (float *)malloc(data_size);
     h_angles = (float *)malloc(angles_size);
@@ -350,7 +367,7 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
-    printf("info: allocate device mem (%6.3f MB)\n", (data_size + angles_size + idx_in_size) / 1000000.0);
+    printf("info: allocate device mem (%6.3f MB)\n", (data_size * 2 + angles_size * 2+ idx_in_size) / 1000000.0);
     HIP_CHECK(hipMalloc(&d_data, data_size));
     HIP_CHECK(hipMalloc(&d_grad_data, data_size));
     HIP_CHECK(hipMalloc(&d_angles, angles_size));
@@ -406,73 +423,87 @@ int main(int argc, char* argv[]) {
     const dim3 threadsPerBlock(BRICK_THREADS_PER_BLOCK);
 
     printf("info: launch kernel\n");
-    hipLaunchKernelGGL(butterfly_brick_forward_slow, blocks, threadsPerBlock, 0, 0, 
-        d_data,
-        d_idx_in,
-        BRICK_INPUT_WIDTH,
-        d_angles, 
-        num_rows,
-        butterfly_depth_in,
-        butterfly_depth_out);
 
-
-    HIP_CHECK(hipMemcpy(h_data, d_data, data_size, hipMemcpyDeviceToHost));
-    printf("output data:\n");
-    for (int i = 0; i < num_rows; i++) {
-        printf("Row %d\n", i);
-        for (int j = 0; j < num_cols; j++) {
-            printf("Col %d: %f\n", j, h_data[j * num_rows + i]);
-        }
-        printf("\n");
+    auto start = high_resolution_clock::now();
+	for (int i = 0; i < rounds + 1; i++) {
+	    hipLaunchKernelGGL(butterfly_brick_forward_slow, blocks, threadsPerBlock, 0, 0, 
+            d_data,
+            d_idx_in,
+            BRICK_INPUT_WIDTH,
+            d_angles, 
+            num_rows,
+            butterfly_depth_in,
+            butterfly_depth_out);
+		if (i == 0) {
+			HIP_CHECK(hipDeviceSynchronize());
+			start = high_resolution_clock::now(); 
+		}
     }
-
-    hipLaunchKernelGGL(butterfly_brick_backward_slow, blocks, threadsPerBlock, 0, 0, 
-        d_data,
-        d_idx_in,
-        BRICK_INPUT_WIDTH,
-        d_angles, 
-        num_rows,
-        butterfly_depth_in,
-        butterfly_depth_out,
-        d_grad_data,
-        d_grad_angles);
 
     HIP_CHECK(hipDeviceSynchronize());
-    printf("info: copy Device2Host\n");
-    HIP_CHECK(hipMemcpy(h_data, d_data, data_size, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(h_grad_data, d_grad_data, data_size, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(h_grad_angles, d_grad_angles, angles_size, hipMemcpyDeviceToHost));
+	auto stop = high_resolution_clock::now(); 
+	auto duration = duration_cast<microseconds>(stop - start); 
+	auto seconds = (float)duration.count() / 1000000.0;
+	cout << "Duration: " << seconds << " (" << (data_size * rounds / seconds / 1000000000) << " GB/s, " << 
+		(num_rows * (butterfly_depth_in * BRICK_INPUT_WIDTH / 2 + butterfly_depth_out * BRICK_INPUT_WIDTH) * rounds * 4 / seconds / 1000000000000.0) << " TFlops" << endl; 
 
-    printf("input data:\n");
-    for (int i = 0; i < num_rows; i++) {
-        printf("Row %d\n", i);
-        for (int j = 0; j < num_cols; j++) {
-            printf("Col %d: %f\n", j, h_data[j * num_rows + i]);
-        }
-        printf("\n");
-    }
+    // HIP_CHECK(hipMemcpy(h_data, d_data, data_size, hipMemcpyDeviceToHost));
+    // printf("output data:\n");
+    // for (int i = 0; i < num_rows; i++) {
+    //     printf("Row %d\n", i);
+    //     for (int j = 0; j < num_cols; j++) {
+    //         printf("Col %d: %f\n", j, h_data[j * num_rows + i]);
+    //     }
+    //     printf("\n");
+    // }
 
-    printf("input data gradient:\n");
-    for (int i = 0; i < num_rows; i++) {
-        printf("Row %d\n", i);
-        for (int j = 0; j < num_cols; j++) {
-            printf("Col %d: %f\n", j, h_grad_data[j * num_rows + i]);
-        }
-        printf("\n");
-    }
+    // hipLaunchKernelGGL(butterfly_brick_backward_slow, blocks, threadsPerBlock, 0, 0, 
+    //     d_data,
+    //     d_idx_in,
+    //     BRICK_INPUT_WIDTH,
+    //     d_angles, 
+    //     num_rows,
+    //     butterfly_depth_in,
+    //     butterfly_depth_out,
+    //     d_grad_data,
+    //     d_grad_angles);
 
-    printf("angles gradient:\n");
-    grad_angles_ptr = h_grad_angles;
-    for (int i = 0; i < butterfly_depth_in; i++) {
-        for (int j = 0; j < BRICK_INPUT_WIDTH / 2; j++) {
-            printf("Input, Depth %d, Angle %d: %f\n", i, j, *grad_angles_ptr);
-            grad_angles_ptr++;
-        }
-    }
-    for (int i = 0; i < butterfly_depth_out; i++) {
-        for (int j = 0; j < BRICK_INPUT_WIDTH; j++) {
-            printf("Output, Depth %d, Angle %d: %f\n", i, j, *grad_angles_ptr);
-            grad_angles_ptr++;
-        }
-    }
+    // HIP_CHECK(hipDeviceSynchronize());
+    // printf("info: copy Device2Host\n");
+    // HIP_CHECK(hipMemcpy(h_data, d_data, data_size, hipMemcpyDeviceToHost));
+    // HIP_CHECK(hipMemcpy(h_grad_data, d_grad_data, data_size, hipMemcpyDeviceToHost));
+    // HIP_CHECK(hipMemcpy(h_grad_angles, d_grad_angles, angles_size, hipMemcpyDeviceToHost));
+
+    // printf("input data:\n");
+    // for (int i = 0; i < num_rows; i++) {
+    //     printf("Row %d\n", i);
+    //     for (int j = 0; j < num_cols; j++) {
+    //         printf("Col %d: %f\n", j, h_data[j * num_rows + i]);
+    //     }
+    //     printf("\n");
+    // }
+
+    // printf("input data gradient:\n");
+    // for (int i = 0; i < num_rows; i++) {
+    //     printf("Row %d\n", i);
+    //     for (int j = 0; j < num_cols; j++) {
+    //         printf("Col %d: %f\n", j, h_grad_data[j * num_rows + i]);
+    //     }
+    //     printf("\n");
+    // }
+
+    // printf("angles gradient:\n");
+    // grad_angles_ptr = h_grad_angles;
+    // for (int i = 0; i < butterfly_depth_in; i++) {
+    //     for (int j = 0; j < BRICK_INPUT_WIDTH / 2; j++) {
+    //         printf("Input, Depth %d, Angle %d: %f\n", i, j, *grad_angles_ptr);
+    //         grad_angles_ptr++;
+    //     }
+    // }
+    // for (int i = 0; i < butterfly_depth_out; i++) {
+    //     for (int j = 0; j < BRICK_INPUT_WIDTH; j++) {
+    //         printf("Output, Depth %d, Angle %d: %f\n", i, j, *grad_angles_ptr);
+    //         grad_angles_ptr++;
+    //     }
+    // }
 }

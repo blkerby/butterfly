@@ -5,7 +5,7 @@ using namespace std::chrono;
 using namespace std;
 
 #define WARP_SIZE_POW 6
-#define ROWS_PER_THREAD 24
+#define ROWS_PER_THREAD 16
 // #define ANGLES_PER_THREAD_POW 0
 // #define ANGLES_PER_THREAD (1 << ANGLES_PER_THREAD_POW)
 // #define COLS_PER_THREAD (2 * ANGLES_PER_THREAD)
@@ -48,7 +48,7 @@ using namespace std;
 // }
 
 template <typename T>
-__global__ void sponge_forward(
+__global__ __launch_bounds__(64, 1) void sponge_forward(
 	T * __restrict__  g_sponge, 
 	// const T *g_angles, 
 	const T * __restrict__ g_cosines, 
@@ -145,7 +145,7 @@ int main() {
 	size_t num_cols_pow = 6;
 	size_t num_cols = 1 << num_cols_pow;
 	size_t angles_per_layer = num_cols / 2;
-	size_t num_layers = 512;
+	size_t num_layers = 12;
 	size_t size_angles = num_layers * angles_per_layer * sizeof(float);
 	size_t size_row = num_cols * sizeof(float);
 	size_t size_data = num_rows * size_row;
@@ -204,7 +204,7 @@ int main() {
 	auto duration = duration_cast<microseconds>(stop - start); 
 	auto seconds = (float)duration.count() / 1000000.0;
 	cout << "Duration: " << seconds << " (" << (size_data * rounds / seconds / 1000000000) << " GB/s, " << 
-		(num_rows * num_cols * num_layers * rounds * 4 / seconds / 1000000000000.0) << " TFlops" << endl; 
+		(num_rows * num_cols / 2 * num_layers * rounds * 4 / seconds / 1000000000000.0) << " TFlops" << endl; 
 	
 
 
