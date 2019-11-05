@@ -91,10 +91,12 @@ __global__ __launch_bounds__(BUTTERFLY_THREADS_PER_BLOCK, 1) void butterfly_forw
                 stride_pow++;
             }
 
-            // Exchange with other threads within the warp/wave
-            #pragma unroll  // Unroll this loop completely
-            for (int i = 1; i < MODULE_WIDTH; i++) {
-                data[i] = __shfl_xor(data[i], i);
+            if (m != BUTTERFLY_MODULE_DEPTH - 1) {
+                // Exchange with other threads within the warp/wave
+                #pragma unroll  // Unroll this loop completely
+                for (int i = 1; i < MODULE_WIDTH; i++) {
+                    data[i] = __shfl_xor(data[i], i);
+                }
             }
         }
 
