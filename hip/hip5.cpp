@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "hip/hip_runtime.h"
 #include <chrono> 
 using namespace std::chrono; 
@@ -18,60 +19,64 @@ using namespace std;
 #define MODULE_DEPTH 4
 #define MODULE_WIDTH (1 << MODULE_DEPTH)
 
-#define BUTTERFLY_MODULE_DEPTH 4
-#define BUTTERFLY_THREADS_PER_BLOCK 256
-#define BUTTERFLY_LOOP_SIZE 16
+#define BUTTERFLY_NUM_MODULES 4
+#define BUTTERFLY_THREADS_PER_BLOCK 512
+#define BUTTERFLY_LOOP_SIZE 8
 #define BUTTERFLY_WIDTH_POW (2 * MODULE_DEPTH)
 #define BUTTERFLY_WIDTH (1 << BUTTERFLY_WIDTH_POW)
-#define BUTTERFLY_DEPTH (BUTTERFLY_MODULE_DEPTH * MODULE_DEPTH)
+#define BUTTERFLY_DEPTH (BUTTERFLY_NUM_MODULES * MODULE_DEPTH)
 #define BUTTERFLY_BATCH_SIZE (BUTTERFLY_THREADS_PER_BLOCK / MODULE_WIDTH)
 #define BUTTERFLY_NUM_ANGLES (BUTTERFLY_WIDTH / 2 * BUTTERFLY_DEPTH)
 
 
 template <typename T>
-__global__ __launch_bounds__(BUTTERFLY_THREADS_PER_BLOCK, 1) void butterfly_forward(
+__global__ __launch_bounds__(BUTTERFLY_THREADS_PER_BLOCK, 2) void butterfly_forward(
     T* g_data,
-    const int* g_idx,
-    T* g_angles, 
-    int col_stride
+    const int* g_idx_in,
+    int idx_out,
+    const T* g_angles, 
+    int row_stride,
+    int num_modules
 ) {
-    __shared__ int s_idx[MODULE_WIDTH];
+    __shared__ int s_idx_in[MODULE_WIDTH];
     __shared__ T s_cosines[BUTTERFLY_NUM_ANGLES];
     __shared__ T s_sines[BUTTERFLY_NUM_ANGLES];
     T data[MODULE_WIDTH];
 
     // Load the data indices (specifying which data columns participate in the butterfly)
     if (hipThreadIdx_y == 0) {
-        s_idx[hipThreadIdx_x] = g_idx[hipThreadIdx_x];
+        s_idx_in[hipThreadIdx_x] = g_idx_in[hipThreadIdx_x];
     }
 
     // Load the angles from global memory, putting their cosines & sines into shared memory.
-    #pragma unroll 1   // Do not unroll this loop
     for (int i = hipThreadIdx_x + hipThreadIdx_y * hipBlockDim_x; i < BUTTERFLY_NUM_ANGLES; 
             i+= BUTTERFLY_THREADS_PER_BLOCK) {
         T angle = g_angles[i];
         s_cosines[i] = cos(angle);
         s_sines[i] = sin(angle);
     }
+    __syncthreads();
 
-    int base_idx = hipThreadIdx_x + BUTTERFLY_LOOP_SIZE * col_stride * (hipThreadIdx_y + hipBlockIdx_x * hipBlockDim_y);
+    int base_idx = hipThreadIdx_x + BUTTERFLY_LOOP_SIZE * row_stride * (hipThreadIdx_y + hipBlockIdx_x * hipBlockDim_y);
     #pragma unroll 1   // Do not unroll this loop
     for (int l = 0; l < BUTTERFLY_LOOP_SIZE; l++) {
         // Load a row of data from global memory into registers
         #pragma unroll  // Unroll this loop completely
         for (int i = 0; i < MODULE_WIDTH; i++) {
-            int idx = s_idx[i];
+            int idx = s_idx_in[i];
             data[i] = g_data[base_idx + idx];
         }
 
-        int angle_idx = 0;
+        int angle_idx = hipThreadIdx_x;
         #pragma unroll 1  // Do not unroll this loop
-        for (int m = 0; m < BUTTERFLY_MODULE_DEPTH; m++) {
+        for (int m = 0; m < BUTTERFLY_NUM_MODULES; m++) {
             // Perform butterfly within the current thread's data
-            int stride = 1;
-            int stride_pow = 0;
+            int stride = 1 << MODULE_DEPTH;
+            int stride_pow = MODULE_DEPTH;
             #pragma unroll  // Unroll this loop completely
             for (int d = 0; d < MODULE_DEPTH; d++) {
+                stride /= 2;
+                stride_pow--;
                 #pragma unroll  // Unroll this loop completely
                 for (int i = 0; i < MODULE_WIDTH / 2; i++) {
                     int idx_x = ((i << (stride_pow + 1)) & (MODULE_WIDTH - 1)) | 
@@ -85,13 +90,11 @@ __global__ __launch_bounds__(BUTTERFLY_THREADS_PER_BLOCK, 1) void butterfly_forw
                     T y1 = -sine * x0 + cosine * y0;
                     data[idx_x] = x1;
                     data[idx_y] = y1;
-                    angle_idx++;
+                    angle_idx += MODULE_WIDTH;
                 }
-                stride *= 2;
-                stride_pow++;
             }
 
-            if (m != BUTTERFLY_MODULE_DEPTH - 1) {
+            if (m != BUTTERFLY_NUM_MODULES - 1) {
                 // Exchange with other threads within the warp/wave
                 #pragma unroll  // Unroll this loop completely
                 for (int i = 1; i < MODULE_WIDTH; i++) {
@@ -101,14 +104,15 @@ __global__ __launch_bounds__(BUTTERFLY_THREADS_PER_BLOCK, 1) void butterfly_forw
         }
 
         // Store a row of data into global memory from registers
+        int idx = base_idx + idx_out;
         #pragma unroll  // Unroll this loop completely
         for (int i = 0; i < MODULE_WIDTH; i++) {
-            int idx = s_idx[i];
-            g_data[base_idx + idx] = data[i];
+            g_data[idx] = data[i];
+            idx += MODULE_WIDTH;
         }
 
         // Update the pointer g_data_row to move to the next row
-        base_idx += col_stride;
+        base_idx += row_stride;
     }
 
 }
@@ -122,8 +126,10 @@ int main(int argc, char* argv[]) {
     int *d_idx_in;
     int rounds = 100;
     long num_rows = (1 << 28) / BUTTERFLY_WIDTH;
-    int num_cols = BUTTERFLY_WIDTH;
+    int num_input_cols = BUTTERFLY_WIDTH;
+    int num_cols = BUTTERFLY_WIDTH * 2;
     int butterfly_depth = BUTTERFLY_DEPTH;
+    long input_size = (long)num_rows * num_input_cols * sizeof(float);
     long data_size = (long)num_rows * num_cols * sizeof(float);
     int angles_size = BUTTERFLY_WIDTH / 2 * butterfly_depth * sizeof(float);
     int idx_in_size = MODULE_WIDTH * sizeof(int);
@@ -157,13 +163,23 @@ int main(int argc, char* argv[]) {
     HIP_CHECK(hipMalloc(&d_idx_in, idx_in_size));
 
     printf("info: initialize data\n");
+    double ss = 0.0;
     for (int i = 0; i < num_rows; i++) {
-        for (int j = 0; j < num_cols; j++) {
+        for (int j = 0; j < num_input_cols; j++) {
             // h_data[j * num_rows + i] = j * (i % 2 * 2 - 1);
-            h_data[i * num_cols + j] = i * num_cols + j;
+            // h_data[i * num_cols + j] = 0.0;
+            double x = (double)rand() / RAND_MAX;
+            h_data[i * num_cols + j] = x;
             // h_grad_data[i * num_cols + j] = 0.0;
+            ss += x * x;
         }
     }
+
+    // h_data[0] = 1.0;
+
+    // for (int j = 0; j < num_input_cols; j++) {
+        // h_data[j] = (double)rand() / RAND_MAX;
+    // }
 
     // for (int i = 0; i < num_rows; i++) {
         // h_grad_data[0 * num_rows + i] = 1.0;
@@ -174,7 +190,7 @@ int main(int argc, char* argv[]) {
     // float *grad_angles_ptr = h_grad_angles;
     for (int i = 0; i < butterfly_depth; i++) {
         for (int j = 0; j < BUTTERFLY_WIDTH / 2; j++) {
-            *angles_ptr = i * 0.01 + j*0.1;
+            *angles_ptr = (float)rand() / RAND_MAX;
             angles_ptr++;
 
             // *grad_angles_ptr = 0.0;
@@ -205,8 +221,10 @@ int main(int argc, char* argv[]) {
 	    hipLaunchKernelGGL(butterfly_forward, blocks, threadsPerBlock, 0, 0, 
             d_data,
             d_idx_in,
+            num_input_cols,
             d_angles, 
-            num_cols);
+            num_cols,
+            BUTTERFLY_NUM_MODULES);
 		if (i == 0) {
 			HIP_CHECK(hipDeviceSynchronize());
 			start = high_resolution_clock::now(); 
@@ -217,19 +235,27 @@ int main(int argc, char* argv[]) {
 	auto stop = high_resolution_clock::now(); 
 	auto duration = duration_cast<microseconds>(stop - start); 
 	auto seconds = (float)duration.count() / 1000000.0;
-	cout << "Duration: " << seconds << " (" << (data_size * rounds / seconds / 1000000000) << " GB/s, " << 
+	cout << "Duration: " << seconds << " (" << (input_size * rounds / seconds / 1000000000) << " GB/s, " << 
 		(num_rows * butterfly_depth * BUTTERFLY_WIDTH / 2 * rounds * 8 / seconds / 1000000000000.0) << " TFlops" << endl; 
 
 
     HIP_CHECK(hipMemcpy(h_data, d_data, data_size, hipMemcpyDeviceToHost));
 
-    for (int i = 0; i < num_rows * num_cols; i++) {
-        float diff = h_data[i] - (i * pow(1.01, rounds + 1));
-        if (fabs(diff / (i + 1)) > 1e-5) {
-            printf("Mismatch: %d: %f\n", i, h_data[i]);
-            exit(1);
+    double ss2 = 0.0;
+    double ss3 = 0.0;
+    for (int i = 0; i < num_rows; i++) {
+        for (int j = 0; j < num_input_cols; j++) {
+            double x = h_data[i * num_cols + j];
+            ss2 += x* x;
+            x = h_data[i * num_cols + j + num_input_cols];
+            ss3 += x * x;
         }
     }
+    printf("ss=%f, ss2=%f, ss3=%f\n", ss, ss2, ss3);
+
+    // for (int i = 0; i < num_input_cols; i++) {
+    //     printf("%d: old=%f, new=%f\n", i, h_data[i], h_data[i + num_input_cols]);
+    // }
 
     // printf("output data:\n");
     // for (int i = 0; i < num_rows; i++) {
