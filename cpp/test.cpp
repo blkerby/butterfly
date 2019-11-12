@@ -10,10 +10,11 @@ using namespace std;
 
 #define ALIGNMENT_BYTES 64
 
-#define BATCH_SIZE 1024
-#define COL_BLOCK_WIDTH_POW 4
+#define BATCH_SIZE (1 << 12)
+#define COL_BLOCK_WIDTH_POW 8
 #define COL_BLOCK_WIDTH (1 << COL_BLOCK_WIDTH_POW)
-#define NUM_BLOCK_ANGLES (COL_BLOCK_WIDTH / 2 * COL_BLOCK_WIDTH)
+#define NUM_BLOCK_LAYERS (COL_BLOCK_WIDTH_POW * 2)
+#define NUM_BLOCK_ANGLES (COL_BLOCK_WIDTH / 2 * NUM_BLOCK_LAYERS)
 
 template <typename T>
 void butterfly_layer_forward(
@@ -27,30 +28,24 @@ void butterfly_layer_forward(
     long num_col_blocks
 ) {
     mipp::Reg<T> x0, x1, y0, y1;
-    T buf[COL_BLOCK_WIDTH][BATCH_SIZE];
 
     // Iterate over the blocks of columns (each consisting of COL_BLOCK_WIDTH columns)
     for (long b = 0; b < num_col_blocks; b++) {
-        // Iterate over small batches of data rows (so that `buf` should fit in L1 cache)
+        // Iterate over small batches of data rows (so that intermediate results fit in cache)
         for (long i = 0; i < num_rows; i += BATCH_SIZE) {
             int stride = 1;
             int stride_pow = 0;
             long a = b * NUM_BLOCK_ANGLES;
             
-            // Load the batch of data into the temporary `buf`, where we will operate on the data in place.
-            for (int j = 0; j < COL_BLOCK_WIDTH; j++) {
-                memcpy(buf[j], data_in_ptrs[b * COL_BLOCK_WIDTH + j] + i, BATCH_SIZE * sizeof(T));
-            }
-
             // Iterate over the butterfly layers within the block:
-            for (int layer = 0; layer < COL_BLOCK_WIDTH_POW; layer++) {
+            for (int layer = 0; layer < NUM_BLOCK_LAYERS; layer++) {
                 // Perform one layer of butterfly within the given column block and row batch:
                 for (int j = 0; j < COL_BLOCK_WIDTH / 2; j++) {
                     int idx_x = ((i << (stride_pow + 1)) & (COL_BLOCK_WIDTH - 1)) | 
                         ((i >> (COL_BLOCK_WIDTH_POW - 1 - stride_pow)) & (stride - 1));
                     int idx_y = idx_x ^ stride;
-                    T *ptr_x = buf[idx_x];
-                    T *ptr_y = buf[idx_y];
+                    T *ptr_x = data_in_ptrs[b * COL_BLOCK_WIDTH + idx_x] + i;
+                    T *ptr_y = data_in_ptrs[b * COL_BLOCK_WIDTH + idx_y] + i;
                     T angle = angles[a];
                     T cosine = cos(angle);
                     T sine = sin(angle);
@@ -74,11 +69,10 @@ void butterfly_layer_forward(
                 }
                 stride *= 2;
                 stride_pow++;
-            }
-
-            // Store the resulting batch of output:
-            for (int j = 0; j < COL_BLOCK_WIDTH; j++) {
-                memcpy(&data_out[col_stride * (b * COL_BLOCK_WIDTH + j)] + i, buf[j], BATCH_SIZE * sizeof(T));
+                if (stride_pow == COL_BLOCK_WIDTH_POW) {
+                    stride = 1;
+                    stride_pow = 0;
+                }
             }
         }
 
@@ -112,8 +106,8 @@ void butterfly_layer_forward(
 
 template <typename T>
 void run() {
-    long num_rows = 1 << 20;
-    long num_col_blocks = 4;
+    long num_rows = 1 << (24 - COL_BLOCK_WIDTH_POW);
+    long num_col_blocks = 16;
     long num_input_cols = num_col_blocks * COL_BLOCK_WIDTH;
     long num_output_cols = num_col_blocks * COL_BLOCK_WIDTH;
     long num_angles = num_col_blocks * NUM_BLOCK_ANGLES;
@@ -121,7 +115,7 @@ void run() {
     T *data_out = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_output_cols * sizeof(T));
     T **data_in_ptrs = (T **)malloc(num_input_cols * sizeof(T *));
     T *angles = (T *)malloc(num_angles * sizeof(T));
-    long rounds = 100;
+    long rounds = 50;
 
     printf("Data in size: %ld\n", num_rows * num_input_cols * sizeof(T));
 
