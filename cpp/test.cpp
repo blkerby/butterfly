@@ -1,4 +1,5 @@
 #include <iostream>
+#include <cstring>
 #include <stdlib.h>
 #include <chrono> 
 #include "mipp.h"
@@ -9,61 +10,129 @@ using namespace std;
 
 #define ALIGNMENT_BYTES 64
 
+#define BATCH_SIZE 1024
+#define COL_BLOCK_WIDTH_POW 4
+#define COL_BLOCK_WIDTH (1 << COL_BLOCK_WIDTH_POW)
+#define NUM_BLOCK_ANGLES (COL_BLOCK_WIDTH / 2 * COL_BLOCK_WIDTH)
+
 template <typename T>
 void butterfly_layer_forward(
-    T *data,
-    long *idx,
+    // T *data,
+    T **data_in_ptrs,
+    T *data_out,
+    // long *idx,
     T *angles,
     long num_rows,
-    long num_cols,
-    long stride
+    long col_stride,
+    long num_col_blocks
 ) {
     mipp::Reg<T> x0, x1, y0, y1;
-    long a = 0;
-    for (long i = 0; i < num_cols;) {
-        long offset_x = idx[i];
-        long offset_y = idx[i ^ stride];
-        T angle = angles[a];
-        T cosine = cos(angle);
-        T sine = sin(angle);
-        T *ptr_x = &data[offset_x];
-        T *ptr_y = &data[offset_y];
-        for (long j = 0; j < num_rows; j += mipp::N<T>()) {
-            x0.load(ptr_x);
-            y0.load(ptr_y);
-            x1 = x0 * cosine + y0 * sine;
-            y1 = y0 * cosine - x0 * sine;
-            x1.store(ptr_x);
-            y1.store(ptr_y);
-            ptr_x += mipp::N<T>();
-            ptr_y += mipp::N<T>();
+    T buf[COL_BLOCK_WIDTH][BATCH_SIZE];
+
+    // Iterate over the blocks of columns (each consisting of COL_BLOCK_WIDTH columns)
+    for (long b = 0; b < num_col_blocks; b++) {
+        // Iterate over small batches of data rows (so that `buf` should fit in L1 cache)
+        for (long i = 0; i < num_rows; i += BATCH_SIZE) {
+            int stride = 1;
+            int stride_pow = 0;
+            long a = b * NUM_BLOCK_ANGLES;
+            
+            // Load the batch of data into the temporary `buf`, where we will operate on the data in place.
+            for (int j = 0; j < COL_BLOCK_WIDTH; j++) {
+                memcpy(buf[j], data_in_ptrs[b * COL_BLOCK_WIDTH + j] + i, BATCH_SIZE * sizeof(T));
+            }
+
+            // Iterate over the butterfly layers within the block:
+            for (int layer = 0; layer < COL_BLOCK_WIDTH_POW; layer++) {
+                // Perform one layer of butterfly within the given column block and row batch:
+                for (int j = 0; j < COL_BLOCK_WIDTH / 2; j++) {
+                    int idx_x = ((i << (stride_pow + 1)) & (COL_BLOCK_WIDTH - 1)) | 
+                        ((i >> (COL_BLOCK_WIDTH_POW - 1 - stride_pow)) & (stride - 1));
+                    int idx_y = idx_x ^ stride;
+                    T *ptr_x = buf[idx_x];
+                    T *ptr_y = buf[idx_y];
+                    T angle = angles[a];
+                    T cosine = cos(angle);
+                    T sine = sin(angle);
+                    
+                    // Perform the rotations for a given column pair, across all rows in the batch:
+                    for (int k = 0; k < BATCH_SIZE; k += mipp::N<T>()) {
+                        x0.load(ptr_x);
+                        y0.load(ptr_y);
+                        x1 = x0 * cosine + y0 * sine;
+                        y1 = y0 * cosine - x0 * sine;
+                        x1.store(ptr_x);
+                        y1.store(ptr_y);
+                        ptr_x += mipp::N<T>();
+                        ptr_y += mipp::N<T>();
+                    }
+                    a++;
+                    j++;
+                    if (j & stride) {
+                        j += stride;
+                    }
+                }
+                stride *= 2;
+                stride_pow++;
+            }
+
+            // Store the resulting batch of output:
+            for (int j = 0; j < COL_BLOCK_WIDTH; j++) {
+                memcpy(&data_out[col_stride * (b * COL_BLOCK_WIDTH + j)] + i, buf[j], BATCH_SIZE * sizeof(T));
+            }
         }
-        a++;
-        i++;
-        if (i & stride) {
-            i += stride;
-        }
+
     }
+    // long a = 0;
+    // for (long i = 0; i < num_cols;) {
+    //     long offset_x = data_in[i];
+    //     long offset_y = data_in[i ^ stride];
+    //     T angle = angles[a];
+    //     T cosine = cos(angle);
+    //     T sine = sin(angle);
+    //     T *ptr_x = &data[offset_x];
+    //     T *ptr_y = &data[offset_y];
+    //     for (long j = 0; j < num_rows; j += mipp::N<T>()) {
+    //         x0.load(ptr_x);
+    //         y0.load(ptr_y);
+    //         x1 = x0 * cosine + y0 * sine;
+    //         y1 = y0 * cosine - x0 * sine;
+    //         x1.store(ptr_x);
+    //         y1.store(ptr_y);
+    //         ptr_x += mipp::N<T>();
+    //         ptr_y += mipp::N<T>();
+    //     }
+    //     a++;
+    //     i++;
+    //     if (i & stride) {
+    //         i += stride;
+    //     }
+    // }
 }
 
 template <typename T>
 void run() {
-    long num_rows = 256;
-    long num_cols = 256;
-    long num_angles = num_cols / 2;
-    T *data = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_cols * sizeof(T));
+    long num_rows = 1 << 20;
+    long num_col_blocks = 4;
+    long num_input_cols = num_col_blocks * COL_BLOCK_WIDTH;
+    long num_output_cols = num_col_blocks * COL_BLOCK_WIDTH;
+    long num_angles = num_col_blocks * NUM_BLOCK_ANGLES;
+    T *data_in = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_input_cols * sizeof(T));
+    T *data_out = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_output_cols * sizeof(T));
+    T **data_in_ptrs = (T **)malloc(num_input_cols * sizeof(T *));
     T *angles = (T *)malloc(num_angles * sizeof(T));
-    long *idx = (long *)malloc(num_cols * sizeof(int));
-    long rounds = 100000;
+    long rounds = 100;
 
-    if (!data || !angles || !idx) {
+    printf("Data in size: %ld\n", num_rows * num_input_cols * sizeof(T));
+
+    if (!data_in || !data_out || !data_in || !angles) {
         cerr << "Unable to allocate memory" << endl;
         exit(1);
     }
 
-    for (long i = 0; i < num_cols; i++) {
+    for (long i = 0; i < num_input_cols; i++) {
         for (long j = 0; j < num_rows; j++) {
-            data[i * num_rows + j] = i;
+            data_in[i * num_rows + j] = i;
         }
     }
 
@@ -71,13 +140,13 @@ void run() {
         angles[i] = i;
     }
 
-    for (long i = 0; i < num_cols; i++) {
-        idx[i] = i * num_rows;
+    for (long i = 0; i < num_input_cols; i++) {
+        data_in_ptrs[i] = &data_in[i * num_rows];
     }
 
     auto start = high_resolution_clock::now();
     for (long i = 0; i < rounds; i++) {
-        butterfly_layer_forward(data, idx, angles, num_rows, num_cols, 1);
+        butterfly_layer_forward(data_in_ptrs, data_out, angles, num_rows, num_rows, num_col_blocks);
     }
 	auto stop = high_resolution_clock::now(); 
 	auto duration = duration_cast<microseconds>(stop - start); 
