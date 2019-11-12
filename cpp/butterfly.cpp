@@ -1,3 +1,5 @@
+#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <iostream>
 #include <cstring>
 #include <stdlib.h>
@@ -22,12 +24,11 @@ using namespace std;
 #define NUM_WORKERS 4
 
 template <typename T>
-void butterfly_layer_forward(
+void cpu_butterfly_forward(
     T **data_in_ptrs,
     T *data_out,
     T *angles,
     long num_rows,
-    long col_stride,
     long num_col_blocks
 ) {
     vector<thread> workers;
@@ -59,6 +60,7 @@ void butterfly_layer_forward(
                             T *ptr_x = data_in_ptrs[col_block * COL_BLOCK_WIDTH + idx_x] + row_idx;
                             T *ptr_y = data_in_ptrs[col_block * COL_BLOCK_WIDTH + idx_y] + row_idx;
                             T angle = angles[a];
+                            // cout << "col_block=" << col_block << ", row_idx=" << row_idx << ", layer=" << layer << ", j=" << j << ", angle=" << angle << ", idx_x=" << idx_x << ", idx_y=" << idx_y << endl;
                             T cosine = cos(angle);
                             T sine = sin(angle);
                             
@@ -74,10 +76,6 @@ void butterfly_layer_forward(
                                 ptr_y += mipp::N<T>();
                             }
                             a++;
-                            j++;
-                            if (j & stride) {
-                                j += stride;
-                            }
                         }
                         stride *= 2;
                         stride_pow++;
@@ -95,6 +93,41 @@ void butterfly_layer_forward(
         t.join();
     });
 }
+
+void butterfly_forward(at::Tensor data, at::Tensor angles, at::Tensor indices_in, long idx_out) {
+    AT_DISPATCH_FLOATING_TYPES(data.type(), "butterfly_forward", ([&] {
+        assert (data.dim() == 2);
+        assert (data.strides()[1] == 1);
+        long num_cols = data.size(0);
+        long num_rows = data.size(1);
+        assert (num_rows % BATCH_SIZE == 0);  // Relax this eventually
+        assert (indices_in.dim() == 1);
+        long total_butterfly_width = indices_in.size(0);
+        assert (total_butterfly_width % COL_BLOCK_WIDTH == 0);
+        long num_col_blocks = total_butterfly_width / COL_BLOCK_WIDTH;
+        assert (angles.dim() == 2);
+        assert (angles.type() == data.type());
+        assert (angles.is_contiguous());
+        assert (angles.size(0) == NUM_BLOCK_LAYERS);
+        assert (angles.size(1) == num_col_blocks * COL_BLOCK_WIDTH / 2);
+        long col_stride = data.strides()[0];
+        long *indices_in_ptr = indices_in.data<long>();
+        scalar_t *data_ptr = data.data<scalar_t>();
+        scalar_t **data_in_ptrs = (scalar_t **)malloc(total_butterfly_width * sizeof(scalar_t *));
+        scalar_t *data_out = data_ptr + col_stride * idx_out;
+
+        for (long i = 0; i < total_butterfly_width; i++) {
+            long col = indices_in_ptr[i];
+            assert (col >= 0 && col < num_cols);
+            data_in_ptrs[i] = data_ptr + col_stride * col;
+        }
+
+        cpu_butterfly_forward(data_in_ptrs, data_out, angles.data<scalar_t>(), num_rows, num_col_blocks);
+        
+        free(data_in_ptrs);
+    }));
+}
+
 
 template <typename T>
 void run() {
@@ -132,7 +165,7 @@ void run() {
 
     auto start = high_resolution_clock::now();
     for (long i = 0; i < rounds; i++) {
-        butterfly_layer_forward(data_in_ptrs, data_out, angles, num_rows, num_rows, num_col_blocks);
+        cpu_butterfly_forward(data_in_ptrs, data_out, angles, num_rows, num_col_blocks);
     }
 	auto stop = high_resolution_clock::now(); 
 	auto duration = duration_cast<microseconds>(stop - start); 
@@ -151,4 +184,8 @@ void run() {
 int main() {
     run<float>();
     return 0;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("butterfly_forward", &butterfly_forward, "butterfly forward pass");
 }
