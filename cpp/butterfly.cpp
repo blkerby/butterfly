@@ -25,10 +25,12 @@ using namespace std;
 
 template <typename T>
 void cpu_butterfly_forward(
-    T **data_in_ptrs,
-    T *data_out,
+    T *data,
+    int *idx_in,
+    int idx_out,
     T *angles,
     long num_rows,
+    long col_stride,
     long num_col_blocks
 ) {
     vector<thread> workers;
@@ -57,8 +59,8 @@ void cpu_butterfly_forward(
                             int idx_x = ((j << (stride_pow + 1)) & (COL_BLOCK_WIDTH - 1)) | 
                                 ((j >> (COL_BLOCK_WIDTH_POW - 1 - stride_pow)) & (stride - 1));
                             int idx_y = idx_x ^ stride;
-                            T *ptr_x = data_in_ptrs[col_block * COL_BLOCK_WIDTH + idx_x] + row_idx;
-                            T *ptr_y = data_in_ptrs[col_block * COL_BLOCK_WIDTH + idx_y] + row_idx;
+                            T *ptr_x = data + col_stride * idx_in[col_block * COL_BLOCK_WIDTH + idx_x] + row_idx;
+                            T *ptr_y = data + col_stride * idx_in[col_block * COL_BLOCK_WIDTH + idx_y] + row_idx;
                             T angle = angles[a];
                             // cout << "col_block=" << col_block << ", row_idx=" << row_idx << ", layer=" << layer << ", j=" << j << ", angle=" << angle << ", idx_x=" << idx_x << ", idx_y=" << idx_y << endl;
                             T cosine = cos(angle);
@@ -94,7 +96,7 @@ void cpu_butterfly_forward(
     });
 }
 
-void butterfly_forward(at::Tensor data, at::Tensor angles, at::Tensor indices_in, long idx_out) {
+void butterfly_forward(at::Tensor data, at::Tensor angles, at::Tensor indices_in, int idx_out) {
     AT_DISPATCH_FLOATING_TYPES(data.type(), "butterfly_forward", ([&] {
         assert (data.dim() == 2);
         assert (data.strides()[1] == 1);
@@ -111,20 +113,15 @@ void butterfly_forward(at::Tensor data, at::Tensor angles, at::Tensor indices_in
         assert (angles.size(0) == NUM_BLOCK_LAYERS);
         assert (angles.size(1) == num_col_blocks * COL_BLOCK_WIDTH / 2);
         long col_stride = data.strides()[0];
-        long *indices_in_ptr = indices_in.data<long>();
+        int *indices_in_ptr = indices_in.data<int>();
         scalar_t *data_ptr = data.data<scalar_t>();
-        scalar_t **data_in_ptrs = (scalar_t **)malloc(total_butterfly_width * sizeof(scalar_t *));
-        scalar_t *data_out = data_ptr + col_stride * idx_out;
 
         for (long i = 0; i < total_butterfly_width; i++) {
             long col = indices_in_ptr[i];
             assert (col >= 0 && col < num_cols);
-            data_in_ptrs[i] = data_ptr + col_stride * col;
         }
 
-        cpu_butterfly_forward(data_in_ptrs, data_out, angles.data<scalar_t>(), num_rows, num_col_blocks);
-        
-        free(data_in_ptrs);
+        cpu_butterfly_forward(data_ptr, indices_in_ptr, idx_out, angles.data<scalar_t>(), num_rows, col_stride, num_col_blocks);
     }));
 }
 
@@ -137,14 +134,15 @@ void run() {
     long num_output_cols = num_col_blocks * COL_BLOCK_WIDTH;
     long num_angles = num_col_blocks * NUM_BLOCK_ANGLES;
     T *data_in = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_input_cols * sizeof(T));
-    T *data_out = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_output_cols * sizeof(T));
-    T **data_in_ptrs = (T **)malloc(num_input_cols * sizeof(T *));
+    // T *data_out = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_output_cols * sizeof(T));
+    // T **data_in_ptrs = (T **)malloc(num_input_cols * sizeof(T *));
+    int *idx_in = (int *)malloc(num_input_cols * sizeof(int));
     T *angles = (T *)malloc(num_angles * sizeof(T));
     long rounds = 1;
 
     printf("Data in size: %ld\n", num_rows * num_input_cols * sizeof(T));
 
-    if (!data_in || !data_out || !data_in || !angles) {
+    if (!data_in || !idx_in || !angles) {
         cerr << "Unable to allocate memory" << endl;
         exit(1);
     }
@@ -160,12 +158,13 @@ void run() {
     }
 
     for (long i = 0; i < num_input_cols; i++) {
-        data_in_ptrs[i] = &data_in[i * num_rows];
+        // data_in_ptrs[i] = &data_in[i * num_rows];
+        idx_in[i] = i;
     }
 
     auto start = high_resolution_clock::now();
     for (long i = 0; i < rounds; i++) {
-        cpu_butterfly_forward(data_in_ptrs, data_out, angles, num_rows, num_col_blocks);
+        cpu_butterfly_forward(data_in, idx_in, num_input_cols, angles, num_rows, num_rows, num_col_blocks);
     }
 	auto stop = high_resolution_clock::now(); 
 	auto duration = duration_cast<microseconds>(stop - start); 
