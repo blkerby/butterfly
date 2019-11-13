@@ -17,15 +17,17 @@ logging.getLogger().setLevel('INFO')
 
 
 device = torch.device('cpu')
-dtype = torch.float32
+dtype = torch.float64
 indices_in = torch.arange(16, dtype=torch.int, device=device)
-# model = cpp.butterfly.ButterflyModule(indices_in, -1)
-model = cpp.butterfly.ButterflyNetwork([indices_in, indices_in], [-1, -1])
+model = cpp.butterfly.ButterflyModule(indices_in, -1, 32, 0, dtype=dtype, device=device)
+# num_input_layers = 8
+# num_output_layers = 0
+# model = cpp.butterfly.ButterflyNetwork([indices_in, indices_in], [-1, -1], num_input_layers, num_output_layers, dtype=dtype, device=device)
 
 ortho = torch.tensor(special_ortho_group.rvs(16), dtype=dtype, device=device)
 
-X_train = torch.rand(size=[16, 1 << 16], dtype=dtype, device=device)
-X_test = torch.rand(size=[16, 1 << 16], dtype=dtype, device=device)
+X_train = torch.rand(size=[16, 1 << 10], dtype=dtype, device=device)
+X_test = torch.rand(size=[16, 1 << 10], dtype=dtype, device=device)
 Y_train = ortho.matmul(X_train)
 Y_test = ortho.matmul(X_test)
 
@@ -36,8 +38,8 @@ def compute_loss(pY, Y):
 def compute_objective(model, loss):
     return loss
 
-optimizer = SR1Optimizer(model.parameters(), memory=2000)
-# optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+# optimizer = SR1Optimizer(model.parameters(), memory=2000)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-3)
 
 for i in range(100000):
     eval_cnt = 0
@@ -78,9 +80,10 @@ for i in range(100000):
                 # logging.info("iter={}: obj={:.8f}, train={:.8f}, test={:.8f}, grad={:.7g}".format(
                 #     i, float(obj), float(train_loss), float(test_loss), gn))
 
-            logging.info("iter={}: obj={:.8f}, train={:.8f}, test={:.8f}, grad={:.7g}, tr_radius={:.3g}".format(
+            logging.info("iter={}: obj={:.7g}, train={:.7g}, test={:.7g}, grad={:.7g}, tr_radius={:.3g}".format(
                 i, obj, train_loss, float(test_loss), gn, tr))
-
+        if gn < 1e-15:
+            break
 #
 #
 # # data = torch.rand(size=[16, 1024], dtype=dtype, device=device)
