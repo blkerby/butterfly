@@ -9,6 +9,7 @@ butterfly_cpp = torch.utils.cpp_extension.load(
     name="butterfly_cpp",
     sources=["cpp/butterfly.cpp"],
     extra_include_paths=["/opt/rocm/hip/include", "cpp/MIPP/src"],
+    extra_cflags=['-O3', '-funroll-loops']
 )
 
 COL_BLOCK_WIDTH = 16
@@ -40,3 +41,18 @@ class ButterflyModule(torch.nn.Module):
 
     def forward(self, data):
         return ButterflyFunction().apply(data, self.angles, self.indices_in, self.idx_out)
+
+
+class ButterflyNetwork(torch.nn.Module):
+    def __init__(self, indices_in_list, idx_out_list, dtype=torch.float32, device=None):
+        super().__init__()
+        layers = []
+        assert len(indices_in_list) == len(idx_out_list)
+        for i in range(len(indices_in_list)):
+            layers.append(ButterflyModule(indices_in_list[i], idx_out_list[i]))
+        self.mods = torch.nn.ModuleList(layers)
+
+    def forward(self, data):
+        for m in self.mods:
+            data = m(data)
+        return data

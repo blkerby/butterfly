@@ -1,5 +1,9 @@
+#define MAKE_TORCH_EXTENSION
+
+#ifdef MAKE_TORCH_EXTENSION
 #include <torch/extension.h>
 #include <ATen/ATen.h>
+#endif
 #include <iostream>
 #include <cstring>
 #include <stdlib.h>
@@ -97,36 +101,6 @@ void cpu_butterfly_forward(
     for_each(workers.begin(), workers.end(), [](thread &t){
         t.join();
     });
-}
-
-void butterfly_forward(at::Tensor data, at::Tensor angles, at::Tensor indices_in, int idx_out) {
-    AT_DISPATCH_FLOATING_TYPES(data.type(), "butterfly_forward", ([&] {
-        assert (data.dim() == 2);
-        assert (data.strides()[1] == 1);
-        long num_cols = data.size(0);
-        long num_rows = data.size(1);
-        assert (num_rows % BATCH_SIZE == 0);  // Relax this eventually
-        assert (indices_in.dim() == 1);
-        long total_butterfly_width = indices_in.size(0);
-        assert (total_butterfly_width % COL_BLOCK_WIDTH == 0);
-        long num_col_blocks = total_butterfly_width / COL_BLOCK_WIDTH;
-        assert (angles.dim() == 2);
-        assert (angles.type() == data.type());
-        assert (angles.is_contiguous());
-        assert (angles.size(0) == NUM_BLOCK_LAYERS);
-        assert (angles.size(1) == num_col_blocks * COL_BLOCK_WIDTH / 2);
-        long col_stride = data.strides()[0];
-        int *indices_in_ptr = indices_in.data<int>();
-        scalar_t *data_ptr = data.data<scalar_t>();
-        scalar_t *angles_ptr = angles.data<scalar_t>();
-
-        for (long i = 0; i < total_butterfly_width; i++) {
-            long col = indices_in_ptr[i];
-            assert (col >= 0 && col < num_cols);
-        }
-
-        cpu_butterfly_forward(data_ptr, indices_in_ptr, idx_out, angles_ptr, num_rows, col_stride, num_col_blocks);
-    }));
 }
 
 template <typename T>
@@ -228,6 +202,37 @@ void cpu_butterfly_backward(
     });
 }
 
+#ifdef MAKE_TORCH_EXTENSION
+void butterfly_forward(at::Tensor data, at::Tensor angles, at::Tensor indices_in, int idx_out) {
+    AT_DISPATCH_FLOATING_TYPES(data.type(), "butterfly_forward", ([&] {
+        assert (data.dim() == 2);
+        assert (data.strides()[1] == 1);
+        long num_cols = data.size(0);
+        long num_rows = data.size(1);
+        assert (num_rows % BATCH_SIZE == 0);  // Relax this eventually
+        assert (indices_in.dim() == 1);
+        long total_butterfly_width = indices_in.size(0);
+        assert (total_butterfly_width % COL_BLOCK_WIDTH == 0);
+        long num_col_blocks = total_butterfly_width / COL_BLOCK_WIDTH;
+        assert (angles.dim() == 2);
+        assert (angles.type() == data.type());
+        assert (angles.is_contiguous());
+        assert (angles.size(0) == NUM_BLOCK_LAYERS);
+        assert (angles.size(1) == num_col_blocks * COL_BLOCK_WIDTH / 2);
+        long col_stride = data.strides()[0];
+        int *indices_in_ptr = indices_in.data<int>();
+        scalar_t *data_ptr = data.data<scalar_t>();
+        scalar_t *angles_ptr = angles.data<scalar_t>();
+
+        for (long i = 0; i < total_butterfly_width; i++) {
+            long col = indices_in_ptr[i];
+            assert (col >= 0 && col < num_cols);
+        }
+
+        cpu_butterfly_forward(data_ptr, indices_in_ptr, idx_out, angles_ptr, num_rows, col_stride, num_col_blocks);
+    }));
+}
+
 void butterfly_backward(at::Tensor data, at::Tensor grad_data, at::Tensor angles, at::Tensor grad_angles, at::Tensor indices_in, int idx_out) {
     AT_DISPATCH_FLOATING_TYPES(data.type(), "butterfly_forward", ([&] {
         assert (data.dim() == 2);
@@ -262,36 +267,47 @@ void butterfly_backward(at::Tensor data, at::Tensor grad_data, at::Tensor angles
     }));
 }
 
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("butterfly_forward", &butterfly_forward, "butterfly forward pass");    
+    m.def("butterfly_backward", &butterfly_backward, "butterfly backward pass");
+}
+#endif
 
+#ifndef MAKE_TORCH_EXTENSION
 template <typename T>
 void run() {
     long num_rows = 1 << (24 - COL_BLOCK_WIDTH_POW);
-    long num_col_blocks = 64;
+    long num_col_blocks = 4;
     long num_input_cols = num_col_blocks * COL_BLOCK_WIDTH;
     long num_output_cols = num_col_blocks * COL_BLOCK_WIDTH;
     long num_angles = num_col_blocks * NUM_BLOCK_ANGLES;
-    T *data_in = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_input_cols * sizeof(T));
+    T *data = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_input_cols * sizeof(T));
+    T *grad_data = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_input_cols * sizeof(T));
+    
     // T *data_out = (T *)aligned_alloc(ALIGNMENT_BYTES, num_rows * num_output_cols * sizeof(T));
     // T **data_in_ptrs = (T **)malloc(num_input_cols * sizeof(T *));
     int *idx_in = (int *)malloc(num_input_cols * sizeof(int));
     T *angles = (T *)malloc(num_angles * sizeof(T));
-    long rounds = 1;
+    T *grad_angles = (T *)malloc(num_angles * sizeof(T));
+    long rounds = 64;
 
     printf("Data in size: %ld\n", num_rows * num_input_cols * sizeof(T));
 
-    if (!data_in || !idx_in || !angles) {
+    if (!data || !idx_in || !angles) {
         cerr << "Unable to allocate memory" << endl;
         exit(1);
     }
 
     for (long i = 0; i < num_input_cols; i++) {
         for (long j = 0; j < num_rows; j++) {
-            data_in[i * num_rows + j] = i;
+            data[i * num_rows + j] = i;
+            grad_data[i * num_rows + j] = 0.0;
         }
     }
 
     for (long i = 0; i < num_angles; i++) {
         angles[i] = i;
+        grad_angles[i] = 0.0;
     }
 
     for (long i = 0; i < num_input_cols; i++) {
@@ -299,16 +315,38 @@ void run() {
         idx_in[i] = i;
     }
 
+    // Forward pass
     auto start = high_resolution_clock::now();
     for (long i = 0; i < rounds; i++) {
-        cpu_butterfly_forward(data_in, idx_in, num_input_cols, angles, num_rows, num_rows, num_col_blocks);
+        cpu_butterfly_forward(data, idx_in, num_input_cols, angles, num_rows, num_rows, num_col_blocks);
     }
 	auto stop = high_resolution_clock::now(); 
 	auto duration = duration_cast<microseconds>(stop - start); 
 	auto seconds = (float)duration.count() / 1000000.0;
     auto rate = (double)rounds * num_rows * num_angles * 8 / seconds;
-    cout << "Took " << seconds << "s (" << (rate / 1000000000) << " GFLOPS)" << endl;
-    
+    cout << "Forward took " << seconds << "s (" << (rate / 1000000000) << " GFLOPS)" << endl;
+
+    start = high_resolution_clock::now();
+    for (long i = 0; i < rounds; i++) {
+        cpu_butterfly_backward(data, grad_data, idx_in, num_input_cols, angles, grad_angles, num_rows, num_rows, num_col_blocks);
+    }
+	stop = high_resolution_clock::now(); 
+	duration = duration_cast<microseconds>(stop - start); 
+	seconds = (float)duration.count() / 1000000.0;
+    rate = (double)rounds * num_rows * num_angles * 8 / seconds;
+    cout << "Backward took " << seconds << "s (" << (rate / 1000000000) << " GFLOPS)" << endl;
+
+    start = high_resolution_clock::now();
+    for (long i = 0; i < rounds; i++) {
+        cpu_butterfly_forward(data, idx_in, num_input_cols, angles, num_rows, num_rows, num_col_blocks);
+        cpu_butterfly_backward(data, grad_data, idx_in, num_input_cols, angles, grad_angles, num_rows, num_rows, num_col_blocks);
+    }
+	stop = high_resolution_clock::now(); 
+	duration = duration_cast<microseconds>(stop - start); 
+	seconds = (float)duration.count() / 1000000.0;
+    rate = (double)rounds * num_rows * num_angles * 8 / seconds;
+    cout << "Combined took " << seconds << "s (" << (rate / 1000000000) << " GFLOPS)" << endl;
+
 
     // for (int j = 0; j < num_rows; j++) {
     //     for (int i = 0; i < num_cols; i++) {
@@ -321,8 +359,4 @@ int main() {
     run<float>();
     return 0;
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("butterfly_forward", &butterfly_forward, "butterfly forward pass");    
-    m.def("butterfly_backward", &butterfly_backward, "butterfly backward pass");
-}
+#endif
