@@ -18,18 +18,88 @@ logging.getLogger().setLevel('INFO')
 
 device = torch.device('cpu')
 dtype = torch.float64
-indices_in = torch.arange(16, dtype=torch.int, device=device)
-model = cpp.butterfly.ButterflyModule(indices_in, -1, 32, 0, dtype=dtype, device=device)
-# num_input_layers = 8
-# num_output_layers = 0
-# model = cpp.butterfly.ButterflyNetwork([indices_in, indices_in], [-1, -1], num_input_layers, num_output_layers, dtype=dtype, device=device)
+# num_activations = 0
+# idx_out = 16
+# num_input_layers = 16
+# num_output_layers = 16
+# num_layers = num_input_layers + num_output_layers
+# indices_in = torch.arange(16, dtype=torch.int, device=device)
+# model = cpp.butterfly.ButterflyModule(indices_in, 16, num_input_layers, num_output_layers, num_activations, curvature=100.0,
+#                                       l2_interact=0, l2_bias=0, biases_initial_std=1.0, dtype=dtype, device=device)
 
-ortho = torch.tensor(special_ortho_group.rvs(16), dtype=dtype, device=device)
+model = cpp.butterfly.ButterflyNetwork(
+    input_width=64,
+    output_width=64,
+    zero_inputs=0,
+    network_depth=16,
+    initial_scale=1.0,
+    l2_scale=0.0,
+    butterfly_in_depth=4,
+    butterfly_out_depth=4,
+    activations_per_block=0,
+    blocks_per_layer=4,
+    curvature=1.0,
+    l2_interact=0.0,
+    l2_bias=0.0,
+    dtype=dtype,
+    device=device)
 
-X_train = torch.rand(size=[16, 1 << 10], dtype=dtype, device=device)
-X_test = torch.rand(size=[16, 1 << 10], dtype=dtype, device=device)
-Y_train = ortho.matmul(X_train)
-Y_test = ortho.matmul(X_test)
+
+# # #
+# torch.random.manual_seed(0)
+# f = cpp.butterfly.ButterflyFunction()
+# data = torch.rand([16 + num_activations, 512], dtype=dtype, device=device)
+# angles = torch.rand([num_layers, 8], dtype=dtype, device=device)
+# biases = torch.rand([num_activations], dtype=dtype, device=device)
+# curvature = 1.0
+# indices_in = torch.arange(16, dtype=torch.int, device=device)
+# # data[:, 0] = 10.0
+# # data[0, 0] = 3.0
+# # data[1, 0] = 7.0
+# # delta = torch.rand_like(data[:, 0]) * 1e-2
+# # data[:, 0] += delta
+# # delta = torch.rand_like(biases) * 1e-2
+# # biases += delta
+# delta = torch.rand_like(angles) * 1e-5
+# angles += delta
+# data.requires_grad = True
+# biases.requires_grad = True
+# angles.requires_grad = True
+# #
+# # # biases[0] = 0.0
+# print(data[:,0])
+# out = f.apply(data, angles, biases, curvature, indices_in, idx_out, num_input_layers, num_output_layers, num_activations)
+# L = out[0, 0]
+# print(data[:,0])
+# # print(torch.sum(data[:16, 0] ** 2))
+# #
+# L.backward()
+# print(data[:, 0])
+#
+# print(data.grad[:, 0])
+# # # torch.dot(data.grad[:, 0], delta)
+# # torch.dot(biases.grad, delta)
+# torch.sum(angles.grad * delta)*10000
+
+
+# #
+# # print(biases.grad)
+# # # print(data[:, 0])
+# # #
+# # # print(out[:, 0])
+#
+#
+# # num_input_layers = 8
+# # num_output_layers = 0
+# # model = cpp.butterfly.ButterflyNetwork([indices_in, indices_in], [-1, -1], num_input_layers, num_output_layers, dtype=dtype, device=device)
+
+ortho_dim = 64
+ortho = torch.tensor(special_ortho_group.rvs(ortho_dim), dtype=dtype, device=device)
+
+X_train = torch.rand(size=[ortho_dim, 1 << 9], dtype=dtype, device=device)
+X_test = torch.rand(size=[ortho_dim, 1 << 9], dtype=dtype, device=device)
+Y_train = ortho.matmul(X_train[:ortho_dim, :])
+Y_test = ortho.matmul(X_test[:ortho_dim, :])
 
 def compute_loss(pY, Y):
     err = Y - pY
@@ -38,8 +108,8 @@ def compute_loss(pY, Y):
 def compute_objective(model, loss):
     return loss
 
-# optimizer = SR1Optimizer(model.parameters(), memory=2000)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-3)
+optimizer = SR1Optimizer(model.parameters(), memory=2000)
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-3)
 
 for i in range(100000):
     eval_cnt = 0
