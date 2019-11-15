@@ -14,6 +14,7 @@ butterfly_cpp = torch.utils.cpp_extension.load(
 )
 
 COL_BLOCK_WIDTH = 16
+ROW_BATCH_SIZE = 512
 
 class ButterflyFunction(torch.autograd.Function):
     """Caution: `forward` and `backward` both modify the input data and gradients in place."""
@@ -87,7 +88,8 @@ class ButterflyNetwork(torch.nn.Module):
                  zero_inputs,
                  network_depth,
                  initial_scale,
-                 l2_scale,
+                 l2_scale_coef,
+                 l2_scale_exp,
                  butterfly_in_depth,
                  butterfly_out_depth,
                  activations_per_block,
@@ -105,7 +107,8 @@ class ButterflyNetwork(torch.nn.Module):
         self.zero_inputs = zero_inputs
         self.network_depth = network_depth
         self.initial_scale = initial_scale
-        self.l2_scale = l2_scale
+        self.l2_scale_coef = l2_scale_coef
+        self.l2_scale_exp = l2_scale_exp
 
         # Hyperparameters specific to the individual ButterflyModule instances:
         self.butterfly_in_depth = butterfly_in_depth
@@ -119,7 +122,7 @@ class ButterflyNetwork(torch.nn.Module):
         # Network-level parameters (The rest of the parameters are inside the ButterflyModules created below):
         self.scales = torch.nn.Parameter(torch.full([input_width], initial_scale, dtype=dtype, device=device))
 
-        layers = []
+        self.layers = []
         self.initial_width = input_width + zero_inputs
         self.input_locations = torch.linspace(0, self.initial_width - 1, steps=input_width).to(torch.long)
         total_width = self.initial_width
@@ -136,15 +139,15 @@ class ButterflyNetwork(torch.nn.Module):
             assert num_layer_inputs <= total_width
             indices_in = torch.randperm(total_width, dtype=torch.int)[:num_layer_inputs]
 
-            layers.append(ButterflyModule(
-                indices_in,
-                total_width,
-                layer_butterfly_in_depth,
-                layer_butterfly_out_depth,
-                layer_activations_per_block,
-                layer_curvature,
-                layer_l2_interact,
-                layer_l2_bias,
+            self.layers.append(ButterflyModule(
+                indices_in=indices_in,
+                idx_out=total_width,
+                num_input_layers=layer_butterfly_in_depth,
+                num_output_layers=layer_butterfly_out_depth,
+                num_activations=layer_activations_per_block,
+                curvature=layer_curvature,
+                l2_interact=layer_l2_interact,
+                l2_bias=layer_l2_bias,
                 biases_initial_std=initial_scale,
                 dtype=dtype,
                 device=device))
@@ -152,7 +155,7 @@ class ButterflyNetwork(torch.nn.Module):
             total_width += layer_blocks_per_layer * activations_per_block
 
         self.total_width = total_width
-        self.sequential = torch.nn.Sequential(*layers)
+        self.sequential = torch.nn.Sequential(*self.layers)
 
     @staticmethod
     def _get_from_list_or_scalar(x, i):
@@ -164,11 +167,13 @@ class ButterflyNetwork(torch.nn.Module):
     def forward(self, input_data):
         assert input_data.dim() == 2
         assert input_data.shape[0] == self.input_width
-        data = torch.zeros([self.total_width, input_data.shape[1]], dtype=self.scales.dtype, device=self.scales.device)
-        data[self.input_locations, :] = self.scales.view(-1, 1) * input_data
+        num_rows = input_data.shape[1]
+        num_padded_rows = (num_rows + ROW_BATCH_SIZE - 1) // ROW_BATCH_SIZE * ROW_BATCH_SIZE
+        data = torch.zeros([self.total_width, num_padded_rows], dtype=self.scales.dtype, device=self.scales.device)
+        data[self.input_locations, :num_rows] = self.scales.view(-1, 1) * input_data
         out = self.sequential(data)
-        return out[(self.total_width - self.output_width):, ]
+        return out[(self.total_width - self.output_width):, :num_rows]
 
     def penalty(self):
-        return torch.sum(self.l2_scale * self.scales ** 2) + \
+        return self.l2_scale_coef * torch.sum(torch.abs(self.scales) ** self.l2_scale_exp) + \
                sum(layer.penalty() for layer in self.layers)
