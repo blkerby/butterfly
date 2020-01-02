@@ -148,13 +148,14 @@ class Sponge(torch.nn.Module):
         self.recall_size = recall_size
         self.depth = depth
         self.butterfly_depth = butterfly_depth
+        self.neutral_curvature = neutral_curvature
         self.activation_position = self.store_size
         self.l2_scale = l2_scale
         self.l2_interact = l2_interact
         self.l2_bias = l2_bias
         self.dtype = dtype
         self.angles = torch.nn.Parameter(torch.rand([depth, butterfly_depth, sponge_size // 2], dtype=dtype, device=device) * 2 * math.pi)
-        self.scales = torch.nn.Parameter(torch.full([input_size], 1.0, dtype=dtype, device=device))
+        self.scales = torch.nn.Parameter(torch.full([input_size], 1.0 / math.sqrt(input_size), dtype=dtype, device=device))
         self.activations = torch.nn.ModuleList([SmoothActivation(
             width=activation_size,
             neutral_curvature=neutral_curvature,
@@ -202,14 +203,20 @@ class Sponge(torch.nn.Module):
             self.recall_elements.append(elements)
             unused_set.difference_update(elements)
 
+        # Set up the butterfly for the input
+        bf_size = input_size // 2 * 2
+        bf_depth = int(math.ceil(math.log2(bf_size)))
+        self.input_butterfly = OrthogonalButterfly(bf_size, bf_depth, l2_interact=l2_interact, dtype=dtype,
+                                                    device=device)
+
         # Set up the butterfly for the output
-        # bf_size = len(unused_set) + sponge_size
-        # bf_depth = int(math.ceil(math.log2(bf_size)))
-        # self.output_memory_list = sorted(unused_set)
-        #
-        # self.output_butterfly = OrthogonalButterfly(bf_size, bf_depth, l2_interact=l2_interact, dtype=dtype,
-        #                                             device=device)
+        bf_size = (len(unused_set) + sponge_size) // 2 * 2
+        bf_depth = int(math.ceil(math.log2(bf_size)))
         self.output_memory_list = sorted(unused_set)
+
+        self.output_butterfly = OrthogonalButterfly(bf_size, bf_depth, l2_interact=l2_interact, dtype=dtype,
+                                                    device=device)
+        # self.output_memory_list = sorted(unused_set)
 
     def fetch_memory(self, memory, j):
         """Fetch the j-th column from the memory list of tensors, as if `memory` were concatenated
@@ -230,6 +237,8 @@ class Sponge(torch.nn.Module):
         assert X.shape[1] == self.input_size
 
         X = X * self.scales
+
+        X = self.input_butterfly(X)
 
         # Initialize the sponge using the first part of the input (as much as will fit in the sponge), padding with zero
         # if the input size is less than the sponge size.
@@ -280,11 +289,36 @@ class Sponge(torch.nn.Module):
             ], dim=1)
 
         pre_output = torch.cat([self.fetch_memory(memory, j).view(-1, 1) for j in self.output_memory_list] + [sponge], dim=1)
-        # output = self.output_butterfly(pre_output)
-        # return output[:, :self.output_size]
-        return pre_output[:, -self.output_size:]
+        output = self.output_butterfly(pre_output)
+        return output[:, :self.output_size]
+        # return pre_output[:, -self.output_size:]
 
     def penalty(self):
         return self.l2_scale * torch.sum(self.scales ** 2) + \
             self.l2_interact * torch.sum(torch.sin(self.angles * 2) ** 2) + \
             sum(a.penalty() for a in self.activations)
+
+    def __repr__(self):
+        return """Sponge(
+            input_size={input_size},
+            output_size={output_size},
+            sponge_size={sponge_size},
+            activation_size={activation_size},
+            recall_size={recall_size},
+            depth={depth},
+            butterfly_depth={butterfly_depth},
+            l2_scale={l2_scale},
+            l2_interact={l2_interact},
+            l2_bias={l2_bias})""".format(
+            input_size=self.input_size,
+            output_size=self.output_size,
+            sponge_size=self.sponge_size,
+            activation_size=self.activation_size,
+            recall_size=self.recall_size,
+            depth=self.depth,
+            butterfly_depth=self.butterfly_depth,
+            neutral_curvature=self.neutral_curvature,
+            l2_scale=self.l2_scale,
+            l2_interact=self.l2_interact,
+            # l2_curvature=self.l2_curvature,
+            l2_bias=self.l2_bias)

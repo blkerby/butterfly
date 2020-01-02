@@ -4,13 +4,14 @@ from linalg import spectral_update, stable_norm, eps
 from trust_region import trust_region_solve
 
 class SR1Optimizer(torch.optim.Optimizer):
-    def __init__(self, params, lam0=1.0, tr_radius=0.1, tr_growth=1.5, memory=10, f_tol=None):
+    def __init__(self, params, lam0=1.0, tr_radius=1.0, tr_growth=1.5, memory=10, f_tol=None):
         super().__init__(params, {})
         self._dtype = self.param_groups[0]['params'][0].data.dtype
         self._numel = sum(p.numel() for group in self.param_groups for p in group['params'])
 
         self.state['x'] = None
         self.state['f'] = None
+        self.state['loss'] = None
         self.state['grad'] = None
         self.state['lam0'] = torch.tensor(lam0, dtype=self._dtype)
         self.state['tr_radius'] = torch.tensor(tr_radius, dtype=self._dtype)
@@ -55,9 +56,14 @@ class SR1Optimizer(torch.optim.Optimizer):
 
     def _eval(self, x, closure):
         self._update_params(x)
-        f = closure()
+        result = closure()
+        if isinstance(result, tuple):
+            f, loss = result
+        else:
+            f = result
+            loss = None
         grad = self._gather_grad()
-        return f, grad
+        return f, grad, loss
 
     def step(self, closure):
         Q_buf = self.state['Q_buf']
@@ -73,9 +79,10 @@ class SR1Optimizer(torch.optim.Optimizer):
             x0 = self.state['x']
             f0 = self.state['f']
             grad0 = self.state['grad']
+            loss0 = self.state['loss']
         else:
             x0 = self._gather_params()
-            f0, grad0 = self._eval(x0, closure)
+            f0, grad0, loss0 = self._eval(x0, closure)
 
         # print("f0: {}, grad norm: {}".format(f0, torch.norm(grad0)))
 
@@ -105,7 +112,7 @@ class SR1Optimizer(torch.optim.Optimizer):
 
         # print("step ratio: {}".format(torch.norm(step) / tr_radius))
         # Evaluate the function and its gradient at the new point
-        f1, grad1 = self._eval(x1, closure)
+        f1, grad1, loss1 = self._eval(x1, closure)
         # print("Expected change: {}, actual: {}".format(expected_change, f1 - f0))
 
         # Update our quadratic model of the function, by an SR1 update.
@@ -163,15 +170,17 @@ class SR1Optimizer(torch.optim.Optimizer):
             tr_radius /= tr_growth
             x1 = x0
             f1 = f0
+            loss1 = loss0
             grad1 = grad0
             self._update_params(x0)
         elif actual_change < expected_change * 0.99:
-            tr_radius = torch.norm(step) * tr_growth
+            tr_radius *= tr_growth
         elif actual_change > expected_change * 0.9:
-            tr_radius = torch.norm(step) / tr_growth
+            tr_radius /= tr_growth
 
         self.state['x'] = x1
         self.state['f'] = f1
+        self.state['loss'] = loss1
         self.state['grad'] = grad1
         self.state['k'] = k
         self.state['lam0'] = lam0

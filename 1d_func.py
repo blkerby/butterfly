@@ -20,8 +20,8 @@ def gen_data(N, scale, noise, dtype=torch.float):
     X = (torch.rand([N, 1], dtype=torch.float) - 0.5) * scale
     # Y = torch.cos(X)
     # Y_true = X * torch.sin(1 / X)
-    # Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
-    Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
+    Y_true = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    # Y_true = torch.round(0.15 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))) * 1.5
     # Y_true = torch.where(X > 0.2, torch.full_like(X, 1.0), torch.full_like(X, -1.0))
     Y = Y_true + noise * torch.randn([N, 1], dtype=torch.float)
     return torch.tensor(X, dtype=dtype), torch.tensor(Y_true, dtype=dtype), torch.tensor(Y, dtype=dtype)
@@ -73,11 +73,11 @@ X_test = add_noise(X_test, num_noise_inputs, scale)
 model = Sponge(
     input_size=1 + num_noise_inputs,
     output_size=1,
-    sponge_size=16,
-    activation_size=4,
-    recall_size=2,
-    depth=32,
-    butterfly_depth=4,
+    sponge_size=8,
+    activation_size=2,
+    recall_size=1,
+    depth=16,
+    butterfly_depth=3,
     neutral_curvature=5.0,
     l2_scale=1e-5,
     l2_interact=0.0,#1e-4,
