@@ -1,14 +1,14 @@
 import torch
 import torch.autograd
 import torch.nn
-import torch.utils.cpp_extension
+# import torch.utils.cpp_extension
 import math
 import os
 import logging
 
-import cpp.butterfly
+# import cpp.butterfly
 from sr1_optimizer import SR1Optimizer
-
+from l1_butterfly import OrthogonalButterfly, L1Butterfly
 
 
 logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s')
@@ -18,13 +18,17 @@ logging.getLogger().setLevel('INFO')
 device = torch.device('cpu')
 dtype = torch.float32
 indices_in = torch.arange(16, dtype=torch.int, device=device)
-model = cpp.butterfly.ButterflyModule(indices_in, -1)
+# model = cpp.butterfly.ButterflyModule(indices_in, -1)
+torch.manual_seed(0)
+# model = OrthogonalButterfly(width_pow=5, depth=60, l2_interact=0.0, dtype=dtype)
+model = L1Butterfly(width_pow=4, depth=8, l2_bias=0.5, dtype=dtype)
 
 perm = torch.randperm(16)
 perm = perm[perm]
 
-X_train = torch.rand(size=[16, 1024], dtype=dtype, device=device)
-X_test = torch.rand(size=[16, 1024], dtype=dtype, device=device)
+N = 16
+X_train = torch.rand(size=[16, N], dtype=dtype, device=device)
+X_test = torch.rand(size=[16, N], dtype=dtype, device=device)
 Y_train = X_train[perm, :]
 Y_test = X_test[perm, :]
 
@@ -35,7 +39,9 @@ def compute_loss(pY, Y):
 def compute_objective(model, loss):
     return loss
 
-optimizer = SR1Optimizer(model.parameters(), memory=2000)
+# optimizer = SR1Optimizer(model.parameters(), memory=2000)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+optimizer.param_groups[0]['lr'] = .001
 
 for i in range(100000):
     eval_cnt = 0
@@ -48,28 +54,34 @@ for i in range(100000):
         optimizer.zero_grad()
         model.zero_grad()
 
-        pY = model(X_train.clone())
+        pY = model(X_train.t().clone()).t()
         train_loss = compute_loss(pY, Y_train)
         obj = compute_objective(model, train_loss)
         obj.backward()
         return obj
 
-    optimizer.step(closure)
+    obj = closure()
+    optimizer.step()
+
+    # optimizer.step(closure)
 
     if i % 1 == 0:
         with torch.no_grad():
             gn = torch.sqrt(sum(torch.sum(x.grad**2) for x in model.parameters()))
-            interact = torch.mean(torch.sin(2 * model.angles) ** 2)
+            # interact = torch.mean(torch.sin(2 * model.params) ** 2)
 
             with torch.no_grad():
-                pY_test = model(X_test.clone())
+                pY_test = model(X_test.t().clone()).t()
                 test_loss = compute_loss(pY_test, Y_test)
 
-            if optimizer.state['f'] != obj:
-                logging.info("iter={}: tr_radius={:.3g} (rejected)".format(i, optimizer.state['tr_radius']))
-            else:
-                logging.info("iter={}: obj={:.8f}, train={:.8f}, test={:.8f}, grad={:.7g}, interact={:.7f}, tr_radius={:.3g}".format(
-                    i, float(optimizer.state['f']), float(train_loss), float(test_loss), gn, interact, optimizer.state['tr_radius']))
+            logging.info(
+                "iter={}: train={:.8f}, test={:.8f}, grad={:.7g}".format(
+                    i, float(train_loss), float(test_loss), gn))
+            # if optimizer.state['f'] != obj:
+            #     logging.info("iter={}: tr_radius={:.3g} (rejected)".format(i, optimizer.state['tr_radius']))
+            # else:
+            #     logging.info("iter={}: obj={:.8f}, train={:.8f}, test={:.8f}, grad={:.7g}, interact={:.7f}, tr_radius={:.3g}".format(
+            #         i, float(optimizer.state['f']), float(train_loss), float(test_loss), gn, interact, optimizer.state['tr_radius']))
 
 
 #

@@ -8,7 +8,7 @@ import math
 butterfly_cpp = torch.utils.cpp_extension.load(
     name="butterfly_cpp",
     sources=["cpp/butterfly.cpp"],
-    extra_include_paths=["/opt/rocm/hip/include", "cpp/MIPP/src"],
+    # extra_include_paths=["/opt/rocm/hip/include", "cpp/MIPP/src"],
     extra_cflags=['-O3', '-funroll-loops'],
     # extra_cflags=['-g'],  # For debugging
 )
