@@ -41,6 +41,60 @@ def l1_sphere_tangent_projection(x, g):
     sgn = torch.where(xz, torch.sign(g), torch.sign(x))
     return simplex_tangent_projection(xz, g * sgn) * sgn
 
+
+import abc
+
+class ParameterManifold(torch.nn.Parameter):
+    @abc.abstractmethod
+    def randomize(self):
+        pass
+
+    @abc.abstractmethod
+    def retract(self, tangent_vec):
+        pass
+
+    @abc.abstractmethod
+    def project_gradient(self, penalty_fn):
+        pass
+
+
+class L1Sphere(ParameterManifold):
+    def randomize(self):
+        """Randomly initialize the points using a uniform distribution"""
+        x = torch.log(torch.rand_like(self.data))
+        x = x / torch.sum(x, dim=1).view(-1, 1)
+        x = x * (torch.randint(2, x.shape, dtype=x.dtype) * 2 - 1)
+        self.data = x
+
+    def retract(self, tangent_vec):
+        """From the current point, take a step in the direction `tangent_vec`, stopping each component at any
+        zero-crossing, and projecting the result back onto the manifold."""
+        x = self.data + tangent_vec
+        sgn = torch.where(self.data == 0, torch.sign(self.data.grad), torch.sign(self.data))
+        stopped = torch.where(torch.sign(x) == -sgn, torch.zeros_like(x), x)
+        self.data = l1_sphere_projection(stopped)
+
+    def project_neg_gradient(self, penalty_fn) -> torch.Tensor:
+        """Project the negative gradient of the objective onto the space of tangent vectors to the manifold at the
+        current point. Here the objective is defined as a loss + penalty, it assumed that the gradient of the
+        loss is already stored in `self.data.grad`, and the penalty is defined as the sum of the evaluation of
+        `penalty_fn` at the absolute value of `self.data` (it is assumed that `penalty_fn` is smooth -- in particular
+        it should be differentiable at 0)."""
+        ng = -self.data.grad
+        d1 = torch.tensor(torch.abs(self.data), requires_grad=True)
+        pen = torch.sum(penalty_fn(d1))
+        pen.backward()
+        dz = self.data == 0
+        sgn = torch.sign(ng)
+        abs_ng = torch.abs(ng)
+        obj_ng = torch.where(dz, sgn * torch.clamp_min(abs_ng - d1.grad, 0.0), ng - d1.grad)
+        return l1_sphere_tangent_projection(self.data, obj_ng)
+
+s = L1Sphere(torch.zeros([3, 4], dtype=torch.float32))
+s.randomize()
+print(torch.sum(torch.abs(s.data), dim=1))
+
+
 b = torch.randn([8, 16]) < 0.0
 A = torch.randn([8, 16])
 
