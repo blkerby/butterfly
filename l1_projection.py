@@ -1,4 +1,5 @@
 import torch
+import abc
 
 def simplex_projection(x):
     xv, xi = x.sort(descending=True, dim=1)
@@ -7,14 +8,19 @@ def simplex_projection(x):
     d = ts - xv
     d1 = torch.where(d > 0, torch.full_like(d, -float('inf')), d)
     js = torch.argmax(d1, dim=1)
-    outs = torch.clamp_min(xv - ts[torch.arange(ts.shape[0]), js], 0.0)
+    outs = torch.clamp_min(xv - ts[torch.arange(ts.shape[0]), js].view(-1, 1), 0.0)
     out = torch.empty_like(outs)
     out.scatter_(dim=1, index=xi, src=outs)
     return out
 
 def l1_sphere_projection(x):
-    sgn = torch.sign(x)
+    sgn = torch.where(x >= 0, torch.full_like(x, 1.0), torch.full_like(x, -1.0))
     return sgn * simplex_projection(torch.abs(x))
+
+def l1_ball_projection(x):
+    l1_norm = torch.sum(torch.abs(x), dim=1)
+    return torch.where(l1_norm <= 1.0, x, l1_sphere_projection(x))
+
 
 def simplex_tangent_projection(xz, g):
     gv, gi = g.sort(descending=True, dim=1)
@@ -42,19 +48,9 @@ def l1_sphere_tangent_projection(x, g):
     return simplex_tangent_projection(xz, g * sgn) * sgn
 
 
-import abc
-
 class ParameterManifold(torch.nn.Parameter):
     @abc.abstractmethod
-    def randomize(self):
-        pass
-
-    @abc.abstractmethod
-    def retract(self, tangent_vec):
-        pass
-
-    @abc.abstractmethod
-    def project_gradient(self, penalty_fn):
+    def project(self):
         pass
 
 
@@ -66,48 +62,151 @@ class L1Sphere(ParameterManifold):
         x = x * (torch.randint(2, x.shape, dtype=x.dtype) * 2 - 1)
         self.data = x
 
-    def retract(self, tangent_vec):
-        """From the current point, take a step in the direction `tangent_vec`, stopping each component at any
-        zero-crossing, and projecting the result back onto the manifold."""
-        x = self.data + tangent_vec
-        sgn = torch.where(self.data == 0, torch.sign(self.data.grad), torch.sign(self.data))
-        stopped = torch.where(torch.sign(x) == -sgn, torch.zeros_like(x), x)
-        self.data = l1_sphere_projection(stopped)
-
-    def project_neg_gradient(self, penalty_fn) -> torch.Tensor:
-        """Project the negative gradient of the objective onto the space of tangent vectors to the manifold at the
-        current point. Here the objective is defined as a loss + penalty, it assumed that the gradient of the
-        loss is already stored in `self.data.grad`, and the penalty is defined as the sum of the evaluation of
-        `penalty_fn` at the absolute value of `self.data` (it is assumed that `penalty_fn` is smooth -- in particular
-        it should be differentiable at 0)."""
-        ng = -self.data.grad
-        d1 = torch.tensor(torch.abs(self.data), requires_grad=True)
-        pen = torch.sum(penalty_fn(d1))
-        pen.backward()
-        dz = self.data == 0
-        sgn = torch.sign(ng)
-        abs_ng = torch.abs(ng)
-        obj_ng = torch.where(dz, sgn * torch.clamp_min(abs_ng - d1.grad, 0.0), ng - d1.grad)
-        return l1_sphere_tangent_projection(self.data, obj_ng)
-
-s = L1Sphere(torch.zeros([3, 4], dtype=torch.float32))
-s.randomize()
-print(torch.sum(torch.abs(s.data), dim=1))
+    def project(self):
+        self.data = l1_sphere_projection(self.data)
 
 
-b = torch.randn([8, 16]) < 0.0
-A = torch.randn([8, 16])
 
-# out = simplex_tangent_projection(
-#     torch.tensor([[False, True, False, False]]),
-#     torch.tensor([[1.5, 0.7, 0.6, 0.2]]))
-out = simplex_tangent_projection(b, A)
-print(torch.sum(out, dim=1))
+class L1Ball(ParameterManifold):
+    def randomize(self):
+        """Randomly initialize the points using a uniform distribution on the boundary"""
+        x = torch.log(torch.rand_like(self.data))
+        x = x / torch.sum(x, dim=1).view(-1, 1)
+        x = x * (torch.randint(2, x.shape, dtype=x.dtype) * 2 - 1)
+        self.data = x
+
+    def project(self):
+        self.data = l1_ball_projection(self.data)
+
+    def project_neg_grad(self):
+        ng = -self.grad
+        d = l1_sphere_tangent_projection(self.data, ng)
+        nm = torch.sum(torch.abs(self.data), dim=1)
+        return torch.where(nm > 0.9999, d, ng)
+
+class LpBall(ParameterManifold):
+    def __new__(cls, data, p):
+        return super().__new__(cls, data)
+
+    def __init__(self, data, p):
+        self.p = p
+
+    def randomize(self):
+        x = torch.log(torch.rand_like(self.data))
+        x = x / torch.sum(x, dim=1).view(-1, 1)
+        x = x * (torch.randint(2, x.shape, dtype=x.dtype) * 2 - 1)
+        self.data = x
+        self.project()
+
+    def project(self):
+        norm = torch.sum(torch.abs(self.data) ** self.p, dim=1) ** (1 / self.p)
+        self.data = torch.where(norm >= 1.0, self.data / norm, self.data)
+
+
+class Box(ParameterManifold):
+    def __new__(cls, data, min_val, max_val):
+        return super().__new__(cls, data)
+
+    def __init__(self, data, min_val, max_val):
+        super().__init__()
+        self.min_val = min_val
+        self.max_val = max_val
+
+    def project(self):
+        self.data = torch.clamp(self.data, self.min_val, self.max_val)
+
+
+class TestModule(torch.nn.Module):
+    def __init__(self, k, p, pen_scale=0.0):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.pen_scale = pen_scale
+        # self.scale = Box(torch.tensor(0.0), -1.0, 1.0)
+        # self.scale = 5.0
+        self.w = L1Ball(torch.zeros([1, k], dtype=torch.float32))
+        # self.w = LpBall(torch.zeros([1, k], dtype=torch.float32), p=p)
+        self.w.randomize()
+
+    def forward(self, X):
+        return torch.matmul(self.w, X) * self.scale
+
+    def penalty(self):
+        return torch.abs(self.scale) * self.pen_scale
+
+
+def compute_loss(py, y):
+    err = py - y
+    return torch.mean(err ** 2)
+
+def compute_objective(loss, model, n):
+    return loss + model.penalty() / n
+
+k = 200
+knz = 3
+N_train = 100
+N_test = 100
+p = 0.8
+torch.manual_seed(3)
+w0 = torch.randn([k])
+w0[knz:] = 0.0
+X_train = torch.randn([k, N_train])
+X_test = torch.randn([k, N_test])
+y_train = torch.matmul(w0, X_train) + torch.randn([N_train]) * 0.1
+y_test = torch.matmul(w0, X_test)
+model = TestModule(k, p, pen_scale=2.0)
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+
+model.pen_scale = 4.5
+# model.w.p = 1.0
+for i in range(10000000):
+    model.zero_grad()
+    py_train = model(X_train)
+    loss = compute_loss(py_train, y_train)
+    obj = compute_objective(loss, model, N_train)
+    obj.backward()
+    # optimizer.step()
+    for param in model.parameters():
+        # param.data = param.data - param.grad * 0.00001
+        if isinstance(param, ParameterManifold):
+            param.data = param.data - param.grad * 0.001
+            # param.data = param.data + param.project_neg_grad() * 0.001
+            param.project()
+        else:
+            param.data = param.data - param.grad * 0.001
+
+    if i % 100 == 0:
+        with torch.no_grad():
+            py_test = model(X_test)
+            test_loss = compute_loss(py_test, y_test)
+            print("iter={}, obj={}, train={}, test={}, scale={}".format(i, obj, loss, test_loss, model.scale))
+
 #
+# s = L1Sphere(torch.zeros([3, 4], dtype=torch.float32))
+# s.randomize()
+# print(torch.sum(torch.abs(s.data), dim=1))
+#
+#
+#
+# b = torch.randn([8, 16]) < 0.0
+# A = torch.randn([8, 16])
+#
+# # out = simplex_tangent_projection(
+# #     torch.tensor([[False, True, False, False]]),
+# #     torch.tensor([[1.5, 0.7, 0.6, 0.2]]))
+# out = simplex_tangent_projection(b, A)
+# print(torch.sum(out, dim=1))
+# #
 # out = simplex_projection(torch.tensor([[1.1, 0.1, 1.2, 1.0],
 #                                        [0.8, -0.2, 0.5, 0.3]]))
 # print(out)
+# #
+# # out = l1_sphere_projection(torch.tensor([[1.1, 0.1, 1.2, 1.0],
+# #                                        [-0.8, -0.2, -0.5, 0.3]]))
+# # print(out)
 #
-# out = l1_sphere_projection(torch.tensor([[1.1, 0.1, 1.2, 1.0],
-#                                        [-0.8, -0.2, -0.5, 0.3]]))
-# print(out)
+# for i in range(100):
+#     A = torch.randn([2, 4])
+#     A[0,0] = 0.0
+#     out = l1_sphere_projection(A)
+#     # out = simplex_projection()
+#     print(torch.sum(torch.abs(out), dim=1))
