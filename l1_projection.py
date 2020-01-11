@@ -22,50 +22,10 @@ def l1_ball_projection(x):
     return torch.where(l1_norm <= 1.0, x, l1_sphere_projection(x))
 
 
-def simplex_tangent_projection(xz, g):
-    gv, gi = g.sort(descending=True, dim=1)
-    xs = torch.gather(xz, dim=1, index=gi)
-    zero = torch.zeros_like(gv)
-    gz = torch.where(xs, gv, zero)
-    gnz = torch.where(xs, zero, gv)
-    snz = torch.sum(gnz, dim=1)
-    nz1 = torch.sum(~xz, dim=1)
-    cs = torch.cumsum(gz, dim=1)
-    c1 = torch.cumsum(xs, dim=1) + nz1.view(-1, 1)
-    ts = (snz.view(-1, 1) + cs) / c1.type(g.dtype)
-    d = ts - gv
-    d1 = torch.where(d > 0, torch.full_like(d, -float('inf')), d)
-    js = torch.argmax(d1, dim=1)
-    gd = gv - ts[torch.arange(ts.shape[0]), js].view(-1, 1)
-    outs = torch.where(xs, torch.clamp_min(gd, 0.0), gd)
-    out = torch.empty_like(outs)
-    out.scatter_(dim=1, index=gi, src=outs)
-    return out
-
-def l1_sphere_tangent_projection(x, g):
-    xz = x == 0
-    sgn = torch.where(xz, torch.sign(g), torch.sign(x))
-    return simplex_tangent_projection(xz, g * sgn) * sgn
-
-
 class ParameterManifold(torch.nn.Parameter):
     @abc.abstractmethod
     def project(self):
         pass
-
-
-class L1Sphere(ParameterManifold):
-    def randomize(self):
-        """Randomly initialize the points using a uniform distribution"""
-        x = torch.log(torch.rand_like(self.data))
-        x = x / torch.sum(x, dim=1).view(-1, 1)
-        x = x * (torch.randint(2, x.shape, dtype=x.dtype) * 2 - 1)
-        self.data = x
-
-    def project(self):
-        self.data = l1_sphere_projection(self.data)
-
-
 
 class L1Ball(ParameterManifold):
     def randomize(self):
@@ -77,30 +37,6 @@ class L1Ball(ParameterManifold):
 
     def project(self):
         self.data = l1_ball_projection(self.data)
-
-    def project_neg_grad(self):
-        ng = -self.grad
-        d = l1_sphere_tangent_projection(self.data, ng)
-        nm = torch.sum(torch.abs(self.data), dim=1)
-        return torch.where(nm > 0.9999, d, ng)
-
-class LpBall(ParameterManifold):
-    def __new__(cls, data, p):
-        return super().__new__(cls, data)
-
-    def __init__(self, data, p):
-        self.p = p
-
-    def randomize(self):
-        x = torch.log(torch.rand_like(self.data))
-        x = x / torch.sum(x, dim=1).view(-1, 1)
-        x = x * (torch.randint(2, x.shape, dtype=x.dtype) * 2 - 1)
-        self.data = x
-        self.project()
-
-    def project(self):
-        norm = torch.sum(torch.abs(self.data) ** self.p, dim=1) ** (1 / self.p)
-        self.data = torch.where(norm >= 1.0, self.data / norm, self.data)
 
 
 class Box(ParameterManifold):
@@ -168,11 +104,11 @@ for i in range(10000000):
     for param in model.parameters():
         # param.data = param.data - param.grad * 0.00001
         if isinstance(param, ParameterManifold):
-            param.data = param.data - param.grad * 0.001
+            param.data = param.data - param.grad * 0.01
             # param.data = param.data + param.project_neg_grad() * 0.001
             param.project()
         else:
-            param.data = param.data - param.grad * 0.001
+            param.data = param.data - param.grad * 0.01
 
     if i % 100 == 0:
         with torch.no_grad():
