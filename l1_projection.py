@@ -1,5 +1,6 @@
 import torch
 import abc
+import matplotlib.pyplot as plt
 
 def simplex_projection(x):
     xv, xi = x.sort(descending=True, dim=1)
@@ -18,14 +19,16 @@ def l1_sphere_projection(x):
     return sgn * simplex_projection(torch.abs(x))
 
 def l1_ball_projection(x):
-    l1_norm = torch.sum(torch.abs(x), dim=1)
-    return torch.where(l1_norm <= 1.0, x, l1_sphere_projection(x))
+    l1_norm = torch.sum(torch.abs(x), dim=1).view(-1, 1)
+    out = torch.where(l1_norm <= 1.0, x, l1_sphere_projection(x))
+    return out
 
 
 class ParameterManifold(torch.nn.Parameter):
     @abc.abstractmethod
     def project(self):
         pass
+
 
 class L1Ball(ParameterManifold):
     def randomize(self):
@@ -52,23 +55,105 @@ class Box(ParameterManifold):
         self.data = torch.clamp(self.data, self.min_val, self.max_val)
 
 
-class TestModule(torch.nn.Module):
-    def __init__(self, k, p, pen_scale=0.0):
+class L1Linear(torch.nn.Module):
+    def __init__(self, input_width, output_width, dtype=torch.float32, device=None):
         super().__init__()
-        self.scale = torch.nn.Parameter(torch.tensor(1.0))
-        self.pen_scale = pen_scale
-        # self.scale = Box(torch.tensor(0.0), -1.0, 1.0)
-        # self.scale = 5.0
-        self.w = L1Ball(torch.zeros([1, k], dtype=torch.float32))
-        # self.w = LpBall(torch.zeros([1, k], dtype=torch.float32), p=p)
-        self.w.randomize()
+        self.weights = L1Ball(torch.zeros([output_width, input_width], dtype=dtype, device=device))
+        self.weights.randomize()
 
     def forward(self, X):
-        return torch.matmul(self.w, X) * self.scale
+        return torch.matmul(self.weights, X)
+
+
+class LeakyReLU(torch.nn.Module):
+    def __init__(self, width, dtype=torch.float32, device=None):
+        super().__init__()
+        self.width = width
+        self.slope_left = Box(torch.rand([width], dtype=dtype, device=device) * 2 - 1, min_val=-1.0, max_val=1.0)
+        self.slope_right = Box(torch.rand([width], dtype=dtype, device=device) * 2 - 1, min_val=-1.0, max_val=1.0)
+        self.knot_position = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+
+    def forward(self, X):
+        X0 = X - self.knot_position.view(-1, 1)
+        out = torch.where(X0 >= 0, self.slope_right.view(-1, 1) * X0, self.slope_left.view(-1, 1) * X0)
+        return out
+
+class Clamp(torch.nn.Module):
+        def __init__(self, width, dtype=torch.float32, device=None):
+            super().__init__()
+            self.width = width
+            self.clamp_width = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+            self.clamp_offset = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+
+        def forward(self, X):
+            w = torch.abs(self.clamp_width).view(-1, 1)
+            c_low = self.clamp_offset.view(-1, 1) - w
+            c_high = self.clamp_offset.view(-1, 1) + w
+            return torch.max(torch.min(X, c_high), c_low)
+
+
+class SmoothLeakyReLU(torch.nn.Module):
+    def __init__(self, width, dtype=torch.float32, device=None):
+        super().__init__()
+        self.width = width
+        self.slope_left = Box(torch.rand([width], dtype=dtype, device=device) * 2 - 1, min_val=-1.0, max_val=1.0)
+        self.slope_right = Box(torch.rand([width], dtype=dtype, device=device) * 2 - 1, min_val=-1.0, max_val=1.0)
+        self.knot_position = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        # self.rounding = torch.nn.Parameter(torch.randn([width], dtype=dtype, device=device))
+        self.rounding = torch.tensor(10.0)
+
+    def forward(self, X):
+        X0 = X - self.knot_position.view(-1, 1)
+        r = self.rounding.view(-1, 1)
+        right = 0.5 * (X0 + torch.sqrt(X0 ** 2 + r ** 2) - torch.abs(r))
+        left = 0.5 * (X0 - torch.sqrt(X0 ** 2 + r ** 2) - torch.abs(r))
+        out = self.slope_left.view(-1, 1) * left + self.slope_right.view(-1, 1) * right
+        # out = torch.where(X0 >= 0, self.slope_right.view(-1, 1) * X0, self.slope_left.view(-1, 1) * X0)
+        return out
+
+
+# model = SmoothLeakyReLU(width=1)
+# model.slope_left[0]=1.0
+# model.slope_right[0]=-1.0
+# model.knot_position[0] = 10.0
+# with torch.no_grad():
+#     xs = 0.1 * (torch.arange(100, dtype=dtype) * 2 - 1)
+#     ys = model(xs).view(-1)
+#     plt.clf()
+#     plt.plot(xs, ys)
+#     plt.show()
+
+class L1Network(torch.nn.Module):
+    def __init__(self, widths, penalty_scale, dtype=torch.float32, device=None):
+        super().__init__()
+        self.widths = widths
+        self.depth = len(widths) - 1
+        self.input_width = widths[0]
+        self.output_width = widths[-1]
+        self.scale = torch.nn.Parameter(torch.full([self.output_width], 1.0, dtype=dtype, device=device))
+        # self.scale = torch.tensor(1.0)
+        self.bias = torch.nn.Parameter(torch.zeros([self.output_width], dtype=dtype, device=device))
+        self.penalty_scale = torch.tensor(penalty_scale)
+        self.layers = []
+        for i in range(self.depth):
+            self.layers.append(L1Linear(widths[i], widths[i + 1], dtype=dtype, device=device))
+            if i != self.depth - 1:
+                self.layers.append(LeakyReLU(widths[i + 1]))
+                # self.layers.append(SmoothLeakyReLU(widths[i + 1]))
+                # self.layers.append(Clamp(widths[i + 1]))
+        self.seq = torch.nn.Sequential(*self.layers)
+
+    def forward(self, X):
+        return self.seq(X) * self.scale.view(-1, 1) + self.bias.view(-1, 1)
 
     def penalty(self):
-        return torch.abs(self.scale) * self.pen_scale
+        return torch.sum(torch.abs(self.scale) * self.penalty_scale)
 
+
+def gen_data(N, scale, dtype=torch.float):
+    X = (torch.rand([1, N], dtype=torch.float) - 0.5) * scale
+    Y = 0.1 * (torch.sin(X) + 3 * torch.cos(2*X) + 4*torch.sin(3*X) + 5*torch.cos(3*X) + torch.cos(0.7*X))
+    return torch.tensor(X, dtype=dtype), torch.tensor(Y, dtype=dtype)
 
 def compute_loss(py, y):
     err = py - y
@@ -77,24 +162,34 @@ def compute_loss(py, y):
 def compute_objective(loss, model, n):
     return loss + model.penalty() / n
 
-k = 200
-knz = 3
 N_train = 100
 N_test = 100
-p = 0.8
-torch.manual_seed(3)
-w0 = torch.randn([k])
-w0[knz:] = 0.0
-X_train = torch.randn([k, N_train])
-X_test = torch.randn([k, N_test])
-y_train = torch.matmul(w0, X_train) + torch.randn([N_train]) * 0.1
-y_test = torch.matmul(w0, X_test)
-model = TestModule(k, p, pen_scale=2.0)
+dtype = torch.float32
+device = torch.device('cpu')
+torch.manual_seed(0)
+
+X_train, y_train = gen_data(N_train, 5) #+ torch.randn([N_train, 1], dtype=dtype)
+X_test, y_test = gen_data(N_test, 5)
+
+model = L1Network(
+    widths=[1, 64, 1],
+    penalty_scale=[5.0],
+    dtype=dtype,
+    device=device)
+
+fig = plt.gcf()
+fig.show()
+fig.canvas.draw()
+
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
 
-model.pen_scale = 4.5
+# model.pen_scale = 4.5
 # model.w.p = 1.0
-for i in range(10000000):
+lr = 0.01
+model.penalty_scale = 0.0
+
+
+for i in range(1000000):
     model.zero_grad()
     py_train = model(X_train)
     loss = compute_loss(py_train, y_train)
@@ -104,17 +199,25 @@ for i in range(10000000):
     for param in model.parameters():
         # param.data = param.data - param.grad * 0.00001
         if isinstance(param, ParameterManifold):
-            param.data = param.data - param.grad * 0.01
+            param.data = param.data - param.grad * lr
             # param.data = param.data + param.project_neg_grad() * 0.001
             param.project()
         else:
-            param.data = param.data - param.grad * 0.01
+            param.data = param.data - param.grad * lr
 
-    if i % 100 == 0:
+    if i % 50 == 0:
         with torch.no_grad():
             py_test = model(X_test)
             test_loss = compute_loss(py_test, y_test)
-            print("iter={}, obj={}, train={}, test={}, scale={}".format(i, obj, loss, test_loss, model.scale))
+            print("iter={}, obj={}, train={}, test={}, scale={}".format(i, obj, loss, test_loss, model.scale.tolist()))
+
+            ind = torch.argsort(X_test[0, :])
+            fig.clear()
+            plt.plot(X_test[0, ind], py_test[0, ind], color='red', linewidth=2.0, zorder=1)
+            plt.scatter(X_train[0, :], y_train[0, :], color='black', marker='.', alpha=0.3, zorder=2)
+            plt.plot(X_test[0, ind], y_test[0, ind], color='blue', zorder=3)
+            fig.canvas.draw()
+
 
 #
 # s = L1Sphere(torch.zeros([3, 4], dtype=torch.float32))
