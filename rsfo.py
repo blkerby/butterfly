@@ -8,7 +8,7 @@ import logging
 logging.basicConfig(format='%(asctime)-15s %(message)s', level=logging.INFO)
 
 class SFOCore:
-    def __init__(self, N, M, L, K, downscale=0.9, delta=200.0, Hscalar=0.1, dtype=torch.float32, device=None):
+    def __init__(self, N, M, L, K, tr_min=1e-6, tr_max=1.0, tr_down=0.5, tr_up=1.1, sr1_clamp=1e5, Hscalar=0.1, dtype=torch.float32, device=None):
         """
         :param N (int): Number of subfunctions
         :param M (int): Number of parameters
@@ -21,22 +21,23 @@ class SFOCore:
         self.M = M
         self.L = L
         self.K = K
-        self.downscale = downscale
-        self.delta = delta
+        self.tr = tr_max
+        self.tr_min = tr_min
+        self.tr_max = tr_max
+        self.tr_down = tr_down
+        self.tr_up = tr_up
+        self.sr1_clamp = sr1_clamp
         self.Q = torch.empty([M, K], dtype=dtype, device=device)  # Orthogonal basis of shared subspace
         self.Qdim = 0  # Current dimension of the shared subspace
         self.H = torch.zeros([N, K, K], dtype=dtype, device=device)  # Low-rank part of the Hessian approximation (with respect to Q basis) for each subfunction
-        self.Hscalar = torch.full([N], Hscalar, dtype=dtype, device=device)  # Scalar diagonal part of the Hessian approximation for each subfunction
+        self.Hscalar = Hscalar  # Scalar diagonal part of the Hessian approximation for each subfunction
         self.active = torch.zeros([N], dtype=dtype, device=device)  # Mask of active subfunctions
         self.f = torch.zeros([N], dtype=dtype, device=device)  # Latest evaluated value for each subfunction
         self.x = torch.zeros([N, K], dtype=dtype, device=device)  # Latest evaluated position for each subfunction
         self.g = torch.zeros([N, K], dtype=dtype, device=device)  # Latest evaluated gradient for each subfunction
         self.x_list = [[] for _ in range(N)]  # For each subfunction, list of past positions (with respect to Q basis) -- used when collapsing the subspace
         self.g_list = [[] for _ in range(N)]  # For each subfunction, list of past gradients (with respect to Q basis) -- used when collapsing the subspace
-        # self.x0 = None
-        # self.f0 = None
-        # self.g0 = None
-        # self.H0 = None
+        self.total_f = None
 
     def update_subfunction(self, i, position, f, grad):
         """
@@ -50,7 +51,7 @@ class SFOCore:
         # Expand Q to include `s` in the subspace
         x = linalg.expand_Q(self.Q, position, self.Qdim)
         if x.shape[0] > self.Qdim:
-            self.H[i, x.shape[0], x.shape[0]] = self.Hscalar[i]
+            self.H[i, x.shape[0], x.shape[0]] = self.Hscalar
             self.Qdim = x.shape[0]
         x = torch.cat([x, torch.zeros([self.K - x.shape[0]], dtype=x.dtype, device=x.device)])  # Pad x with zeros
         self.x[i, :] = x
@@ -59,14 +60,13 @@ class SFOCore:
         # Expand Q to include `y` in the subspace
         g = linalg.expand_Q(self.Q, grad, self.Qdim)
         if g.shape[0] > self.Qdim:
-            self.H[i, g.shape[0], g.shape[0]] = self.Hscalar[i]
+            self.H[i, g.shape[0], g.shape[0]] = self.Hscalar
             self.Qdim = g.shape[0]
         g = torch.cat([g, torch.zeros([self.K - g.shape[0]], dtype=g.dtype, device=g.device)])  # Pad g with zeros
         self.g[i, :] = g
         self.g_list[i].append(g)
 
         if len(self.x_list[i]) >= 2:
-            # Perform relaxed BFGS update on the Hessian approximation for this subfunction (TODO: actually add the "relaxed" part)
             s = x[:self.Qdim] - self.x_list[i][-2][:self.Qdim]
             y = g[:self.Qdim] - self.g_list[i][-2][:self.Qdim]
             # ys = torch.dot(y, s)
@@ -79,14 +79,17 @@ class SFOCore:
             r = y - torch.mv(H, s)
             rs = torch.dot(r, s)
             rr = torch.dot(r, r)
-            if rs != 0.0:
-                if rr > self.delta * abs(rs):
-                    r = r / (rr / (self.delta * abs(rs)))
-                    rs = torch.dot(r, s)
-                    rr = torch.dot(r, r)
-                    logging.info("Clamping SR1 update: {}".format(rr / rs))
+            # if rs != 0.0:
+            #     if rr > self.sr1_clamp * abs(rs):
+            #         r = r / (rr / (self.delta * abs(rs)))
+            #         rs = torch.dot(r, s)
+            #         rr = torch.dot(r, r)
+            #         logging.info("Clamping SR1 update: {}".format(rr / rs))
+            #     self.H[i, :self.Qdim, :self.Qdim] = self.H[i, :self.Qdim, :self.Qdim] + (1 / rs) * torch.ger(r, r)
+            if rr < self.sr1_clamp * abs(rs):
                 self.H[i, :self.Qdim, :self.Qdim] = self.H[i, :self.Qdim, :self.Qdim] + (1 / rs) * torch.ger(r, r)
-
+            else:
+                logging.info("Skipping SR1 update")
         if self.Qdim >= self.K - 1:
             self.collapse_subspace()
 
@@ -109,12 +112,20 @@ class SFOCore:
     def collapse_subspace(self):
         pass
 
-    def trust_region_step(self, x0, tr_radius):
+    def trust_region_step(self, x0):
         f, g, H = self.eval(x0)
+        if self.total_f is not None:
+            if f < self.total_f:
+                self.tr = min(self.tr_max, self.tr * self.tr_up)
+            else:
+                self.tr = max(self.tr_min, self.tr * self.tr_down)
+        self.total_f = f
         eig, U = torch.symeig(H, eigenvectors=True)
+        self.Hscalar = torch.median(eig)
         Ug = torch.mv(U.t(), g)
-        s = torch.mv(U, trust_region_solve(eig, Ug, tr_radius))
+        s = torch.mv(U, trust_region_solve(eig, Ug, self.tr))
         return x0 + torch.mv(self.Q[:, :self.Qdim], s)
+
 
 class SFO(torch.optim.Optimizer):
     def __init__(self,
@@ -122,9 +133,12 @@ class SFO(torch.optim.Optimizer):
                  num_subfunctions,
                  min_history,
                  subspace_dim,
-                 downscale=0.9,
-                 delta=20000.0,
-                 max_tr_radius=1.0,
+                 tr_min=1e-6,
+                 tr_max=1.0,
+                 tr_down=0.5,
+                 tr_up=1.1,
+                 sr1_clamp=1e5,
+                 Hscalar=0.1,
                  dtype=torch.float32, device=None):
         super().__init__(params, {})
         self.num_params = sum(p.numel() for group in self.param_groups for p in group['params'])
@@ -133,20 +147,22 @@ class SFO(torch.optim.Optimizer):
             M=self.num_params,
             L=min_history,
             K=subspace_dim,
-            downscale=downscale,
-            delta=delta,
+            tr_min=tr_min,
+            tr_max=tr_max,
+            tr_down=tr_down,
+            tr_up=tr_up,
+            sr1_clamp=sr1_clamp,
+            Hscalar=Hscalar,
             dtype=dtype,
             device=device)
         self.next_subfunction = 0
-        self.max_tr_radius = max_tr_radius
-        self.tr_radius = max_tr_radius
 
     def step(self, closure):
         f = closure(self.next_subfunction)
         grad = self._gather_grad()
         x0 = self._gather_params()
         self.core.update_subfunction(self.next_subfunction, x0, f, grad)
-        x1 = self.core.trust_region_step(x0, self.tr_radius)
+        x1 = self.core.trust_region_step(x0)
         self._update_params(x1)
         self.next_subfunction = (self.next_subfunction + 1) % self.core.N
 
@@ -231,7 +247,7 @@ scaler.fit(np_X_train)
 pre_X_train = scaler.transform(np_X_train)
 pre_X_test = scaler.transform(np_X_test)
 
-dtype = torch.float64
+dtype = torch.float32
 device = torch.device('cpu')
 
 X_train = torch.tensor(pre_X_train, dtype=dtype, device=device)
@@ -272,8 +288,13 @@ sfo = SFO(
     params=model.parameters(),
     num_subfunctions=num_batches,
     min_history=2,
-    subspace_dim=num_batches*300,
-    max_tr_radius=0.04,
+    tr_min=1e-8,
+    tr_max=1.0 / num_batches,
+    tr_down=0.2 ** (1 / num_batches),
+    tr_up=1.3 ** (1 / num_batches),
+    sr1_clamp=1e12,
+    Hscalar=1.0,
+    subspace_dim=3000,
     dtype=dtype,
     device=device)
 
@@ -306,7 +327,7 @@ for it in range(100000):
         pY_test = model(X_test)
         test_loss = compute_loss(pY_test, y_test)
         gn = torch.norm(torch.sum(sfo.core.g, dim=0)) / num_rows_train
-        print("it={}, obj={}, grad={}, test={}".format(
-            it, torch.sum(sfo.core.f) / num_rows_train, gn, test_loss / num_rows_test))
+        print("it={}, obj={}, grad={}, test={}, tr={}".format(
+            it, sfo.core.total_f / num_rows_train, gn, test_loss / num_rows_test, sfo.core.tr))
     # print("epoch={}, obj={}, train={}, test={}, grad={}".format(
     #     epoch, train_obj / num_rows_train, total_train_loss / num_rows_train, test_loss / num_rows_test, gn))
