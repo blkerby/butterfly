@@ -5,7 +5,7 @@ from trust_region import trust_region_solve
 
 
 class SFOCore:
-    def __init__(self, N, M, L, K, downscale=0.9, delta=2.0, dtype=torch.float32, device=None):
+    def __init__(self, N, M, L, K, downscale=0.9, delta=2.0, Hscalar=5.0, dtype=torch.float32, device=None):
         """
         :param N (int): Number of subfunctions
         :param M (int): Number of parameters
@@ -22,6 +22,7 @@ class SFOCore:
         self.Q = torch.empty([M, K], dtype=dtype, device=device)  # Orthogonal basis of shared subspace
         self.Qdim = 0  # Current dimension of the shared subspace
         self.H = torch.zeros([N, K, K], dtype=dtype, device=device)  # Low-rank part of the Hessian approximation (with respect to Q basis) for each subfunction
+        self.Hscalar = torch.full([N], Hscalar, dtype=dtype, device=device)  # Scalar diagonal part of the Hessian approximation for each subfunction
         self.active = torch.zeros([N], dtype=dtype, device=device)  # Mask of active subfunctions
         self.f = torch.zeros([N], dtype=dtype, device=device)  # Latest evaluated value for each subfunction
         self.x = torch.zeros([N, K], dtype=dtype, device=device)  # Latest evaluated position for each subfunction
@@ -40,14 +41,18 @@ class SFOCore:
 
         # Expand Q to include `s` in the subspace
         x = linalg.expand_Q(self.Q, position, self.Qdim)
-        self.Qdim = x.shape[0]
+        if x.shape[0] > self.Qdim:
+            self.H[i, x.shape[0], x.shape[0]] = self.Hscalar[i]
+            self.Qdim = x.shape[0]
         x = torch.cat([x, torch.zeros([self.K - x.shape[0]], dtype=x.dtype, device=x.device)])  # Pad x with zeros
         self.x[i, :] = x
         self.x_list[i].append(x)
 
         # Expand Q to include `y` in the subspace
         g = linalg.expand_Q(self.Q, grad, self.Qdim)
-        self.Qdim = g.shape[0]
+        if g.shape[0] > self.Qdim:
+            self.H[i, g.shape[0], g.shape[0]] = self.Hscalar[i]
+            self.Qdim = g.shape[0]
         g = torch.cat([g, torch.zeros([self.K - g.shape[0]], dtype=g.dtype, device=g.device)])  # Pad g with zeros
         self.g[i, :] = g
         self.g_list[i].append(g)
@@ -242,14 +247,14 @@ num_rows_train = X_train.shape[0]
 num_rows_test = X_test.shape[0]
 
 # 2186
-num_batches = 10
+num_batches = 1
 
 sfo = SFO(
     params=model.parameters(),
     num_subfunctions=num_batches,
     min_history=2,
-    subspace_dim=num_batches*300,
-    max_tr_radius=0.1,
+    subspace_dim=num_batches*3000,
+    max_tr_radius=0.5,
     dtype=dtype,
     device=device)
 
@@ -273,13 +278,13 @@ def closure(batch_num):
 
 sfo.full_pass(closure)
 for it in range(100000):
-    sfo.tr_radius = 100.0 / (it + 10) ** 1.5
+    # sfo.tr_radius = 100.0 / (it + 10) ** 1.5
     sfo.step(closure)
     with torch.no_grad():
         # gn = math.sqrt(sum(torch.sum(p.grad ** 2) for p in model.parameters())) / num_rows_train
         pY_test = model(X_test)
         test_loss = compute_loss(pY_test, y_test)
-        print("it={}, test={}".format(
-            it, test_loss / num_rows_test))
+        print("it={}, obj={}, test={}".format(
+            it, sfo.core.f[0] / num_rows_train, test_loss / num_rows_test))
     # print("epoch={}, obj={}, train={}, test={}, grad={}".format(
     #     epoch, train_obj / num_rows_train, total_train_loss / num_rows_train, test_loss / num_rows_test, gn))
