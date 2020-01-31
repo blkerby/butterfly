@@ -51,7 +51,7 @@ class SFOCore:
         # Expand Q to include `s` in the subspace
         x = linalg.expand_Q(self.Q, position, self.Qdim)
         if x.shape[0] > self.Qdim:
-            self.H[i, x.shape[0], x.shape[0]] = self.Hscalar
+            self.H[i, x.shape[0] - 1, x.shape[0] - 1] = self.Hscalar
             self.Qdim = x.shape[0]
         x = torch.cat([x, torch.zeros([self.K - x.shape[0]], dtype=x.dtype, device=x.device)])  # Pad x with zeros
         self.x[i, :] = x
@@ -60,7 +60,7 @@ class SFOCore:
         # Expand Q to include `y` in the subspace
         g = linalg.expand_Q(self.Q, grad, self.Qdim)
         if g.shape[0] > self.Qdim:
-            self.H[i, g.shape[0], g.shape[0]] = self.Hscalar
+            self.H[i, g.shape[0] - 1, g.shape[0] - 1] = self.Hscalar
             self.Qdim = g.shape[0]
         g = torch.cat([g, torch.zeros([self.K - g.shape[0]], dtype=g.dtype, device=g.device)])  # Pad g with zeros
         self.g[i, :] = g
@@ -110,7 +110,33 @@ class SFOCore:
         return f, g, H
 
     def collapse_subspace(self):
-        pass
+        xs = [x[:self.Qdim] for ls in self.x_list for x in ls[-self.L:]]
+        gs = [g[:self.Qdim] for ls in self.g_list for g in ls[-self.L:]]
+        vs = torch.stack(xs + gs, dim=1)
+        P, _ = torch.qr(vs)
+        ndim = P.shape[1]
+        logging.info("Collapsing SFO subspace (dim {} -> {})".format(self.Qdim, ndim))
+        Q1 = torch.mm(self.Q[:, :self.Qdim], P)
+        x1 = torch.mm(self.x[:, :self.Qdim], P)
+        g1 = torch.mm(self.g[:, :self.Qdim], P)
+        H1 = torch.einsum('ijk,jm,kn', self.H[:, :self.Qdim, :self.Qdim], P, P)
+        # self.Q[:, :ndim] = Q1
+        self.x[:, :ndim] = x1
+        self.x[:, ndim:] = 0.0
+        self.g[:, :ndim] = g1
+        self.g[:, ndim:] = 0.0
+        self.H[:, ndim:, :] = 0.0
+        self.H[:, :, ndim:] = 0.0
+        self.H[:, :ndim, :ndim] = H1
+        z = torch.zeros([self.K - ndim], dtype=P.dtype, device=P.device)
+        self.x_list = [[torch.cat([torch.mv(P.t(), x[:self.Qdim]), z]) for x in ls[-self.L:]] for ls in self.x_list]
+        self.g_list = [[torch.cat([torch.mv(P.t(), g[:self.Qdim]), z]) for g in ls[-self.L:]] for ls in self.g_list]
+        self.Qdim = ndim
+
+        # To prevent `Q` from drifting from orthonormal, we project it back using its polar decomposition (computed using SVD).
+        U, S, V = torch.svd(Q1)
+        Q2 = torch.mm(U, V.t())
+        self.Q[:, :ndim] = Q2
 
     def trust_region_step(self, x0):
         f, g, H = self.eval(x0)
@@ -282,19 +308,20 @@ num_rows_train = X_train.shape[0]
 num_rows_test = X_test.shape[0]
 
 # 2186
-num_batches = 10
+num_batches = 3
+min_history = 4
 
 sfo = SFO(
     params=model.parameters(),
     num_subfunctions=num_batches,
-    min_history=2,
-    tr_min=1e-8,
-    tr_max=1.0 / num_batches,
-    tr_down=0.2 ** (1 / num_batches),
-    tr_up=1.3 ** (1 / num_batches),
-    sr1_clamp=1e12,
+    min_history=min_history,
+    tr_min=1e-5,
+    tr_max=5.0 / num_batches,
+    tr_down=0.1 ** (1 / num_batches),
+    tr_up=1.1 ** (1 / num_batches),
+    sr1_clamp=1e10,
     Hscalar=1.0,
-    subspace_dim=3000,
+    subspace_dim=(min_history * 2) * num_batches * 2,
     dtype=dtype,
     device=device)
 

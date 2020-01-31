@@ -1,5 +1,6 @@
 import torch
 import linalg
+import logging
 
 def subproblem_solve(a, d, y, max_iter):
     """Given the function f(x) defined by
@@ -7,6 +8,7 @@ def subproblem_solve(a, d, y, max_iter):
     where a[i] >= 0, d[i] >= 0, a[0] > 0, and y > 0, use Newton's method to return the unique solution to
     f(x) = y with x > 0.
     """
+    # logging.info("subproblem_solve: a={}, d={}, y={}".format(a, d, y))
     x0 = torch.max(torch.sqrt(a / y) - d) * (1.0 + linalg.eps(a.dtype))
     for i in range(max_iter):
         f0 = torch.sum(a / (x0 + d)**2)
